@@ -1,0 +1,63 @@
+services:
+  # Backend API - connects to external MCP server
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: spectra-backend
+    environment:
+      # Configure the MCP server URL - default assumes MCP server is on host
+      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://host.docker.internal:8000}
+      # OpenAI API key for LLM (can also be configured via UI)
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Anthropic API key (alternative provider)
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      # LLM model to use (optional, defaults to gpt-5.2)
+      LLM_MODEL: ${LLM_MODEL:-gpt-5.2}
+    volumes:
+      # Persistent storage for configuration (API keys, MCP URL, etc.)
+      - spectra-config:/app/config
+      # Docker socket for container logs access (troubleshooting)
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    expose:
+      - "8080"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 15s
+    networks:
+      - spectra-network
+
+  # Frontend (nginx serving React app)
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: spectra-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:80/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    networks:
+      - spectra-network
+
+volumes:
+  spectra-config:
+    name: spectra-config
+
+networks:
+  spectra-network:
+    name: spectra-network
+    driver: bridge

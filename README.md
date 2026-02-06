@@ -193,15 +193,15 @@ Access settings via the **⚙️ gear icon** in the header. Settings are persist
 | **MCP Server URL** | URL where Purple-MCP is running | `http://host.docker.internal:8000` |
 | **LLM Provider** | AI model provider (OpenAI, Anthropic, Google) | OpenAI |
 | **API Key** | API key for the selected provider | — |
-| **Model** | Model to use (dropdown shows models for selected provider) | `gpt-4o` |
+| **Model** | Model to use (dropdown shows models for selected provider) | `gpt-5.2` |
 
 **Available Models by Provider:**
 
 | Provider | API Key Required | Models |
 |----------|------------------|--------|
-| **OpenAI** | OpenAI API key | `gpt-4o`, `gpt-4o-mini`, `gpt-4-turbo`, `o1`, `o1-mini`, `o3-mini` |
-| **Anthropic** | Anthropic API key | `claude-sonnet-4-20250514`, `claude-3-5-sonnet-20241022`, `claude-3-5-haiku-20241022` |
-| **Google** | Google AI API key | `gemini-2.0-flash`, `gemini-1.5-pro`, `gemini-1.5-flash` |
+| **OpenAI** | OpenAI API key | `gpt-5.2`, `gpt-5.1`, `gpt-5`, `gpt-5-mini`, `gpt-5-nano` |
+| **Anthropic** | Anthropic API key | `claude-sonnet-4-20250514`, `claude-3-5-sonnet-20241022`, `claude-3-haiku-20240307` |
+| **Google** | Google AI API key | `gemini-1.5-pro`, `gemini-1.5-flash`, `gemini-pro` |
 
 ---
 

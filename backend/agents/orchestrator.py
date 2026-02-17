@@ -1,0 +1,319 @@
+"""SPECTRA Orchestrator - routes queries to specialist agents."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+from typing import Any
+
+from agents.alert_triage import AlertTriageAgent
+from agents.asset_intel import AssetIntelAgent
+from agents.base import BaseAgent
+from agents.correlation import CorrelationAgent
+from agents.posture import PostureAgent
+from agents.threat_hunt import ThreatHuntAgent
+from agents.vulnerability import VulnerabilityAgent
+from config import AppConfig
+from llm_providers import LLMProvider
+from mcp_client import MCPClient
+from models import AgentResponse, ToolDefinition
+
+logger = logging.getLogger("spectra")
+
+GENERAL_SYSTEM_PROMPT = """You are a SOC (Security Operations Center) analyst assistant powered by SentinelOne. You help security analysts investigate threats, triage alerts, and understand their security posture.
+
+You have access to tools that query real SentinelOne data. Use them autonomously to answer questions.
+
+BEHAVIOR RULES:
+1. NEVER ask the user to choose options - ACT AUTONOMOUSLY
+2. NEVER tell the user to run queries manually - YOU execute them
+3. ALWAYS present results as formatted tables when you have structured data
+4. Be concise but thorough. Execute queries and present results."""
+
+SYNTHESIS_PROMPT = """You are a SOC analyst synthesizing results from multiple specialist agents.
+
+Given the original user query and findings from multiple agents, create a single coherent response that:
+1. Integrates all findings into a unified narrative
+2. Highlights correlations between different data domains
+3. Provides a prioritized summary of critical findings
+4. Includes actionable recommendations
+
+Do NOT repeat raw data - synthesize and analyze it. Format with markdown headers, tables where appropriate, and clear prioritization."""
+
+
+class Orchestrator:
+    """Routes incoming queries to the appropriate specialist agent(s).
+
+    The orchestrator:
+    1. Classifies the incoming query into one or more domains
+    2. Routes to single or multiple specialist agents
+    3. For multi-agent queries, runs agents in parallel and synthesizes results
+    4. Falls back to a general agent with all tools if no specialist matches
+    """
+
+    def __init__(self):
+        self.agents: dict[str, BaseAgent] = {}
+        self._register_default_agents()
+
+    def _register_default_agents(self):
+        """Register the default set of specialist agents."""
+        for agent_cls in [
+            AlertTriageAgent,
+            ThreatHuntAgent,
+            VulnerabilityAgent,
+            AssetIntelAgent,
+            PostureAgent,
+            CorrelationAgent,
+        ]:
+            agent = agent_cls()
+            self.agents[agent.name] = agent
+
+    def register_agent(self, agent: BaseAgent):
+        """Register an additional specialist agent."""
+        self.agents[agent.name] = agent
+        logger.info(f"Registered agent: {agent.name}")
+
+    def get_agent_descriptions(self) -> list[dict[str, Any]]:
+        """Return descriptions of all registered agents."""
+        return [
+            {
+                "name": agent.name,
+                "description": agent.description,
+                "tools": agent.tool_names,
+            }
+            for agent in self.agents.values()
+        ]
+
+    async def classify(
+        self, query: str, config: AppConfig, mcp_client: MCPClient
+    ) -> list[str]:
+        """Classify a query and return the best agent name(s).
+
+        Returns a list of agent names. Multiple agents indicate a multi-domain
+        query that needs parallel execution and synthesis.
+        """
+        agent_list = "\n".join(
+            f"- {a.name}: {a.description}" for a in self.agents.values()
+        )
+
+        classification_prompt = f"""You are a query router. Given the user's security question, determine which specialist agent(s) should handle it.
+
+Available agents:
+{agent_list}
+- general: Handles queries that don't clearly match any specialist.
+
+ROUTING RULES:
+- For simple single-domain questions, return ONE agent name.
+- For cross-domain correlation queries (e.g., "risk posture of endpoint X", "correlate alerts with vulnerabilities"), return "correlation".
+- For multi-domain questions that need separate answers (e.g., "show alerts and list assets"), return multiple agent names separated by commas.
+- When unsure, prefer "correlation" for complex multi-domain queries.
+
+Respond with ONLY the agent name(s), comma-separated if multiple. Examples:
+- "alert_triage"
+- "threat_hunt"
+- "correlation"
+- "alert_triage,vulnerability"
+- "general"
+
+Nothing else."""
+
+        try:
+            provider = LLMProvider(config, mcp_client)
+            result = await provider.simple_call(classification_prompt, f"User query: {query}")
+            result = result.strip().lower().strip('"').strip("'")
+
+            # Parse comma-separated agent names
+            agent_names = [n.strip() for n in result.split(",") if n.strip()]
+
+            # Validate all names
+            valid_names = []
+            for name in agent_names:
+                if name in self.agents:
+                    valid_names.append(name)
+                elif name == "general":
+                    valid_names.append("general")
+                else:
+                    # Try to extract known agent name from the response
+                    for agent_name in self.agents:
+                        if agent_name in name:
+                            valid_names.append(agent_name)
+                            break
+
+            if valid_names:
+                logger.info(f"LLM classified query as: {valid_names}")
+                return valid_names
+
+        except Exception as e:
+            logger.warning(f"LLM classification failed: {e}, falling back to keyword matching")
+
+        # Keyword-based fallback
+        return [self._keyword_classify(query)]
+
+    def _keyword_classify(self, query: str) -> str:
+        """Fallback keyword-based classification."""
+        query_lower = query.lower()
+
+        alert_keywords = ["alert", "alerts", "incident", "incidents", "detection", "detections", "threat", "threats"]
+        vuln_keywords = ["vulnerability", "vulnerabilities", "cve", "cves", "patch", "exploit", "cvss"]
+        hunt_keywords = [
+            "hunt", "hunting", "process", "network connection", "lateral movement",
+            "persistence", "powerquery", "telemetry", "deep visibility", "purple ai",
+            "endpoint activity", "file operation", "dns", "registry",
+        ]
+        asset_keywords = ["inventory", "asset", "assets", "endpoint", "endpoints", "server", "servers", "device", "devices"]
+        posture_keywords = ["misconfiguration", "misconfig", "compliance", "posture", "cloud security", "iam", "benchmark"]
+        correlation_keywords = ["risk posture", "correlate", "correlation", "security overview", "comprehensive", "investigate"]
+
+        # Check correlation first (multi-domain indicators)
+        if any(w in query_lower for w in correlation_keywords):
+            return "correlation"
+        if any(w in query_lower for w in hunt_keywords):
+            return "threat_hunt"
+        if any(w in query_lower for w in alert_keywords):
+            return "alert_triage"
+        if any(w in query_lower for w in vuln_keywords):
+            return "vulnerability"
+        if any(w in query_lower for w in posture_keywords):
+            return "posture"
+        if any(w in query_lower for w in asset_keywords):
+            return "asset_intel"
+
+        return "general"
+
+    async def process(
+        self,
+        query: str,
+        conversation_history: list | None,
+        config: AppConfig,
+        mcp_client: MCPClient,
+    ) -> str:
+        """Process a query through the orchestrator.
+
+        1. Discover available tools
+        2. Classify the query
+        3. Route to single or multiple agents
+        4. Synthesize multi-agent results if needed
+        """
+        all_tools = await mcp_client.discover_tools()
+        logger.info(f"Orchestrator processing query with {len(all_tools)} tools available")
+
+        agent_names = await self.classify(query, config, mcp_client)
+
+        # Filter out "general" from the list
+        specialist_names = [n for n in agent_names if n != "general" and n in self.agents]
+
+        if not specialist_names:
+            # No specialist matched — use general with all tools
+            return await self._run_general(
+                query, conversation_history, config, mcp_client, all_tools
+            )
+
+        if len(specialist_names) == 1:
+            # Single agent routing
+            agent = self.agents[specialist_names[0]]
+            logger.info(f"Routing to specialist agent: {agent.name}")
+            response = await agent.execute(
+                query=query,
+                conversation_history=conversation_history,
+                mcp_client=mcp_client,
+                config=config,
+                all_tools=all_tools,
+            )
+
+            if response.is_error:
+                logger.warning(f"Agent {agent.name} returned error, falling back to general")
+                return await self._run_general(
+                    query, conversation_history, config, mcp_client, all_tools
+                )
+
+            return response.content
+
+        # Multi-agent routing — run agents in parallel
+        logger.info(f"Multi-agent routing to: {specialist_names}")
+        agents_to_run = [self.agents[n] for n in specialist_names]
+
+        responses = await asyncio.gather(
+            *[
+                agent.execute(
+                    query=query,
+                    conversation_history=conversation_history,
+                    mcp_client=mcp_client,
+                    config=config,
+                    all_tools=all_tools,
+                )
+                for agent in agents_to_run
+            ],
+            return_exceptions=True,
+        )
+
+        # Collect successful results
+        agent_results = []
+        for i, resp in enumerate(responses):
+            if isinstance(resp, Exception):
+                logger.error(f"Agent {agents_to_run[i].name} raised exception: {resp}")
+            elif isinstance(resp, AgentResponse) and not resp.is_error:
+                agent_results.append(resp)
+            else:
+                logger.warning(f"Agent {agents_to_run[i].name} returned error")
+
+        if not agent_results:
+            return await self._run_general(
+                query, conversation_history, config, mcp_client, all_tools
+            )
+
+        if len(agent_results) == 1:
+            return agent_results[0].content
+
+        # Synthesize multiple agent results
+        return await self._synthesize(query, agent_results, config, mcp_client)
+
+    async def _synthesize(
+        self,
+        query: str,
+        responses: list[AgentResponse],
+        config: AppConfig,
+        mcp_client: MCPClient,
+    ) -> str:
+        """Synthesize results from multiple specialist agents into a single response."""
+        combined = "\n\n".join(
+            f"=== {r.agent_name.upper()} AGENT FINDINGS ===\n{r.content}"
+            for r in responses
+        )
+
+        # Truncate if too long
+        if len(combined) > 60000:
+            combined = combined[:60000] + "\n\n... [truncated]"
+
+        user_prompt = f"""User Query: {query}
+
+Agent Findings:
+{combined}
+
+Synthesize these findings into a single comprehensive response."""
+
+        try:
+            provider = LLMProvider(config, mcp_client)
+            return await provider.simple_call(SYNTHESIS_PROMPT, user_prompt)
+        except Exception as e:
+            logger.error(f"Synthesis failed: {e}")
+            # Fallback: concatenate results
+            return "\n\n---\n\n".join(r.content for r in responses)
+
+    async def _run_general(
+        self,
+        query: str,
+        conversation_history: list | None,
+        config: AppConfig,
+        mcp_client: MCPClient,
+        all_tools: list[ToolDefinition],
+    ) -> str:
+        """Run a general query with all available tools."""
+        logger.info("Running general agent with all tools")
+        provider = LLMProvider(config, mcp_client)
+        return await provider.run_agent_loop(
+            system_prompt=GENERAL_SYSTEM_PROMPT,
+            user_query=query,
+            tools=all_tools,
+            conversation_history=conversation_history,
+        )

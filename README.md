@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/spectra-logo.png" alt="SPECTRA Logo" width="150">
+</p>
+
 # SPECTRA
 
 **S**ecurity **P**osture **E**xploration & **C**orrelated **T**hreat **R**esponse **A**ssistant
@@ -320,4 +324,8 @@ MIT License - See [LICENSE](LICENSE) for details.
 
 <p align="center">
   Crafted with 💜 by The AI Chef Brigade (Nate Smalley and Marco Rottigni a.k.a. The RoarinPenguin)
+</p>
+
+<p align="center">
+  <img src="assets/ai-chef-brigade-logo.png" alt="The AI Chef Brigade" width="250">
 </p>

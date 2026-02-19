@@ -51,12 +51,49 @@ def _detect_powerquery(text: str) -> str | None:
     return None
 
 
-async def execute_mcp_tool(mcp_client: MCPClient, tool_name: str, arguments: dict) -> str:
+def _summarize_args(arguments: dict, max_len: int = 120) -> str:
+    """Create a brief human-readable summary of tool arguments."""
+    if not arguments:
+        return ""
+    parts = []
+    for k, v in arguments.items():
+        val = str(v)
+        if len(val) > 60:
+            val = val[:57] + "..."
+        parts.append(f"{k}: {val}")
+    summary = ", ".join(parts)
+    if len(summary) > max_len:
+        summary = summary[:max_len - 3] + "..."
+    return summary
+
+
+async def execute_mcp_tool(
+    mcp_client: MCPClient,
+    tool_name: str,
+    arguments: dict,
+    tools_log: list[str] | None = None,
+    tool_calls_sequence: list[dict] | None = None,
+) -> str:
     """Execute an MCP tool and return the result as a string.
 
     For purple_ai: Automatically detects and executes any PowerQuery returned,
     combining the explanation with actual query results.
+
+    If tools_log is provided, appends tool_name (and 'powerquery' for auto-executed
+    PowerQueries) so callers can track which tools were actually invoked.
+
+    If tool_calls_sequence is provided, appends an ordered record of each call
+    with tool name and a brief args summary for the thought-process trace.
     """
+    if tools_log is not None and tool_name not in tools_log:
+        tools_log.append(tool_name)
+
+    if tool_calls_sequence is not None:
+        tool_calls_sequence.append({
+            "tool": tool_name,
+            "args": _summarize_args(arguments),
+        })
+
     try:
         result = await mcp_client.call_tool(tool_name, arguments)
 
@@ -77,11 +114,19 @@ async def execute_mcp_tool(mcp_client: MCPClient, tool_name: str, arguments: dic
                 end_datetime = end_dt.isoformat().replace("+00:00", "Z")
 
                 try:
-                    pq_result = await mcp_client.call_tool("powerquery", {
+                    if tools_log is not None and "powerquery" not in tools_log:
+                        tools_log.append("powerquery")
+                    pq_args = {
                         "query": powerquery_str,
                         "start_datetime": start_datetime,
                         "end_datetime": end_datetime,
-                    })
+                    }
+                    if tool_calls_sequence is not None:
+                        tool_calls_sequence.append({
+                            "tool": "powerquery",
+                            "args": _summarize_args(pq_args),
+                        })
+                    pq_result = await mcp_client.call_tool("powerquery", pq_args)
                     pq_content = extract_mcp_result(pq_result)
 
                     if pq_content and "error" not in pq_result:
@@ -111,25 +156,34 @@ class LLMProvider:
         tools: list[ToolDefinition],
         conversation_history: list | None = None,
         max_iterations: int = 10,
-    ) -> str:
-        """Run an agentic tool-calling loop with the configured LLM provider."""
+    ) -> tuple[str, list[str], list[dict]]:
+        """Run an agentic tool-calling loop with the configured LLM provider.
+
+        Returns:
+            Tuple of (response_text, unique_tools_called, ordered_tool_calls_sequence).
+        """
+        tools_log: list[str] = []
+        tool_calls_sequence: list[dict] = []
+
         if not self.config.llm_api_key:
-            return "**LLM not configured.** Please configure an API key in Settings."
+            return "**LLM not configured.** Please configure an API key in Settings.", tools_log, tool_calls_sequence
 
         if self.config.llm_provider == "openai":
-            return await self._run_openai_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations
+            result = await self._run_openai_loop(
+                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
             )
         elif self.config.llm_provider == "anthropic":
-            return await self._run_anthropic_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations
+            result = await self._run_anthropic_loop(
+                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
             )
         elif self.config.llm_provider == "google":
-            return await self._run_google_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations
+            result = await self._run_google_loop(
+                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
             )
         else:
-            return f"Unknown LLM provider: {self.config.llm_provider}"
+            result = f"Unknown LLM provider: {self.config.llm_provider}"
+
+        return result, tools_log, tool_calls_sequence
 
     async def simple_call(self, system_prompt: str, user_prompt: str) -> str:
         """Simple LLM call without function calling (for classification, synthesis, etc.)."""
@@ -180,6 +234,8 @@ class LLMProvider:
         tools: list[ToolDefinition],
         conversation_history: list | None,
         max_iterations: int,
+        tools_log: list[str] | None = None,
+        tool_calls_sequence: list[dict] | None = None,
     ) -> str:
         openai_tools = mcp_to_openai(tools)
         messages = [{"role": "system", "content": system_prompt}]
@@ -231,7 +287,7 @@ class LLMProvider:
                         arguments = {}
 
                     logger.info(f"OpenAI calling tool: {tool_name}")
-                    tool_result = await execute_mcp_tool(self.mcp_client, tool_name, arguments)
+                    tool_result = await execute_mcp_tool(self.mcp_client, tool_name, arguments, tools_log, tool_calls_sequence)
 
                     messages.append({
                         "role": "tool",
@@ -275,6 +331,8 @@ class LLMProvider:
         tools: list[ToolDefinition],
         conversation_history: list | None,
         max_iterations: int,
+        tools_log: list[str] | None = None,
+        tool_calls_sequence: list[dict] | None = None,
     ) -> str:
         anthropic_tools = mcp_to_anthropic(tools)
         messages = []
@@ -333,7 +391,7 @@ class LLMProvider:
 
                         logger.info(f"Anthropic calling tool: {tool_name}")
                         tool_output = await execute_mcp_tool(
-                            self.mcp_client, tool_name, tool_input
+                            self.mcp_client, tool_name, tool_input, tools_log, tool_calls_sequence
                         )
 
                         tool_results.append({
@@ -378,6 +436,8 @@ class LLMProvider:
         tools: list[ToolDefinition],
         conversation_history: list | None,
         max_iterations: int,
+        tools_log: list[str] | None = None,
+        tool_calls_sequence: list[dict] | None = None,
     ) -> str:
         google_tools = mcp_to_google(tools)
         contents = []
@@ -438,7 +498,7 @@ class LLMProvider:
 
                     logger.info(f"Google calling tool: {tool_name}")
                     tool_output = await execute_mcp_tool(
-                        self.mcp_client, tool_name, tool_args
+                        self.mcp_client, tool_name, tool_args, tools_log, tool_calls_sequence
                     )
 
                     function_responses.append({

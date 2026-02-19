@@ -62,18 +62,18 @@ class BaseAgent(ABC):
 
         try:
             logger.info(f"Agent {self.name} executing with {len(agent_tools)} tools")
-            result = await provider.run_agent_loop(
+            result, tools_used, calls_sequence = await provider.run_agent_loop(
                 system_prompt=self.system_prompt,
                 user_query=query,
                 tools=agent_tools,
                 conversation_history=conversation_history,
                 max_iterations=10,
             )
-            tools_used = [t.name for t in agent_tools]
             return AgentResponse(
                 agent_name=self.name,
                 content=result,
                 tools_called=tools_used,
+                tool_calls_sequence=calls_sequence,
             )
         except Exception as e:
             logger.error(f"Agent {self.name} error: {e}")

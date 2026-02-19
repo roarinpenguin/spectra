@@ -83,4 +83,5 @@ class AgentResponse(BaseModel):
     agent_name: str
     content: str
     tools_called: list[str] = Field(default_factory=list)
+    tool_calls_sequence: list[dict] = Field(default_factory=list)
     is_error: bool = False

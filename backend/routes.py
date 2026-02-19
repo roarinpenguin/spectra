@@ -184,14 +184,14 @@ async def execute_query(request: QueryRequest, raw_request: Request):
                 mcp_client = get_mcp_client()
                 stream.emit("orchestrator_start", {"status": "classifying"})
                 with Timer() as timer:
-                    result = await orchestrator.process(
+                    outcome = await orchestrator.process(
                         query=request.query,
                         conversation_history=request.conversation_history,
                         config=config,
                         mcp_client=mcp_client,
                     )
-                metrics.record_routing("streamed", is_multi_agent=False)
-                stream.result("success", result)
+                metrics.record_routing(outcome.get("agent", "unknown"), is_multi_agent="+" in outcome.get("agent", ""))
+                stream.result("success", outcome["result"])
             except Exception as e:
                 logger.error(f"Streaming query error: {e}")
                 stream.error(str(e))
@@ -203,13 +203,19 @@ async def execute_query(request: QueryRequest, raw_request: Request):
     try:
         mcp_client = get_mcp_client()
         with Timer() as timer:
-            result = await orchestrator.process(
+            outcome = await orchestrator.process(
                 query=request.query,
                 conversation_history=request.conversation_history,
                 config=config,
                 mcp_client=mcp_client,
             )
-        return {"status": "success", "result": result}
+        return {
+            "status": "success",
+            "result": outcome["result"],
+            "agent": outcome.get("agent", "general"),
+            "tools_used": outcome.get("tools_used", []),
+            "thought_process": outcome.get("thought_process"),
+        }
 
     except HTTPException:
         raise

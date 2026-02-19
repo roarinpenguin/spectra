@@ -23,13 +23,27 @@ logger = logging.getLogger("spectra")
 
 GENERAL_SYSTEM_PROMPT = """You are a SOC (Security Operations Center) analyst assistant powered by SentinelOne. You help security analysts investigate threats, triage alerts, and understand their security posture.
 
-You have access to tools that query real SentinelOne data. Use them autonomously to answer questions.
+You have access to tools that query real SentinelOne data via MCP (Model Context Protocol). Use them autonomously to answer questions.
+
+DATA SOURCE ATTRIBUTION:
+When presenting findings, naturally reference which SentinelOne MCP tools and data sources you used.
+For example: "I queried `list_alerts` and found 12 active alerts, then used `purple_ai` to investigate the most critical one..."
+
+OUTPUT FORMAT:
+Use proper markdown with ## headers, tables, and bullet lists. Be concise and scannable.
+IMPORTANT: Use single backticks for inline tool/field names (e.g. `list_alerts`), NEVER triple-backtick code blocks for tool names.
+
+SENTINELONE RECOMMENDATIONS:
+When providing remediation or next steps, ONLY recommend SentinelOne platform capabilities. NEVER recommend competitor security products.
+Key capabilities: STAR (custom detection/response rules), Network Quarantine, Remote Shell, Storyline (attack chain visualization), Singularity Identity (ITDR), Singularity Ranger (attack surface), Singularity Cloud Security (CNAPP), Vigilance MDR, Singularity Marketplace (integrations), Device Control, Firewall Control, Application Control.
+Map findings to MITRE ATT&CK techniques and suggest specific STAR rules where applicable.
 
 BEHAVIOR RULES:
 1. NEVER ask the user to choose options - ACT AUTONOMOUSLY
 2. NEVER tell the user to run queries manually - YOU execute them
 3. ALWAYS present results as formatted tables when you have structured data
-4. Be concise but thorough. Execute queries and present results."""
+4. Be concise but thorough. Execute queries and present results.
+5. NEVER recommend competitor security products — only SentinelOne capabilities."""
 
 SYNTHESIS_PROMPT = """You are a SOC analyst synthesizing results from multiple specialist agents.
 
@@ -37,9 +51,12 @@ Given the original user query and findings from multiple agents, create a single
 1. Integrates all findings into a unified narrative
 2. Highlights correlations between different data domains
 3. Provides a prioritized summary of critical findings
-4. Includes actionable recommendations
+4. Includes actionable recommendations using SentinelOne capabilities
 
-Do NOT repeat raw data - synthesize and analyze it. Format with markdown headers, tables where appropriate, and clear prioritization."""
+Use proper markdown with ## headers, tables, and bullet lists. Use single backticks for tool/field names.
+Do NOT repeat raw data - synthesize and analyze it.
+NEVER recommend competitor security products. Only recommend SentinelOne platform capabilities (STAR rules, Network Quarantine, Remote Shell, Singularity Identity, Ranger, Cloud Security, Vigilance MDR, etc.).
+Map findings to MITRE ATT&CK techniques and suggest specific STAR rules where applicable."""
 
 
 class Orchestrator:
@@ -187,13 +204,16 @@ Nothing else."""
         conversation_history: list | None,
         config: AppConfig,
         mcp_client: MCPClient,
-    ) -> str:
+    ) -> dict[str, Any]:
         """Process a query through the orchestrator.
 
         1. Discover available tools
         2. Classify the query
         3. Route to single or multiple agents
         4. Synthesize multi-agent results if needed
+
+        Returns:
+            Dict with 'result' (str), 'agent' (str), 'tools_used' (list[str]).
         """
         all_tools = await mcp_client.discover_tools()
         logger.info(f"Orchestrator processing query with {len(all_tools)} tools available")
@@ -205,9 +225,16 @@ Nothing else."""
 
         if not specialist_names:
             # No specialist matched — use general with all tools
-            return await self._run_general(
+            result = await self._run_general(
                 query, conversation_history, config, mcp_client, all_tools
             )
+            result["thought_process"] = {
+                "classification": "general",
+                "reason": "No specialist agent matched",
+                "tool_calls": result.get("tool_calls_sequence", []),
+            }
+            result.pop("tool_calls_sequence", None)
+            return result
 
         if len(specialist_names) == 1:
             # Single agent routing
@@ -223,11 +250,27 @@ Nothing else."""
 
             if response.is_error:
                 logger.warning(f"Agent {agent.name} returned error, falling back to general")
-                return await self._run_general(
+                result = await self._run_general(
                     query, conversation_history, config, mcp_client, all_tools
                 )
+                result["thought_process"] = {
+                    "classification": f"{agent.name} (fallback to general)",
+                    "reason": f"{agent.name} agent returned an error",
+                    "tool_calls": result.get("tool_calls_sequence", []),
+                }
+                result.pop("tool_calls_sequence", None)
+                return result
 
-            return response.content
+            return {
+                "result": response.content,
+                "agent": response.agent_name,
+                "tools_used": response.tools_called,
+                "thought_process": {
+                    "classification": response.agent_name,
+                    "reason": f"Routed to {response.agent_name} specialist",
+                    "tool_calls": response.tool_calls_sequence,
+                },
+            }
 
         # Multi-agent routing — run agents in parallel
         logger.info(f"Multi-agent routing to: {specialist_names}")
@@ -249,24 +292,58 @@ Nothing else."""
 
         # Collect successful results
         agent_results = []
+        all_tools_used: list[str] = []
+        all_tool_calls: list[dict] = []
+        agent_labels: list[str] = []
         for i, resp in enumerate(responses):
             if isinstance(resp, Exception):
                 logger.error(f"Agent {agents_to_run[i].name} raised exception: {resp}")
             elif isinstance(resp, AgentResponse) and not resp.is_error:
                 agent_results.append(resp)
+                agent_labels.append(resp.agent_name)
+                for t in resp.tools_called:
+                    if t not in all_tools_used:
+                        all_tools_used.append(t)
+                all_tool_calls.extend(resp.tool_calls_sequence)
             else:
                 logger.warning(f"Agent {agents_to_run[i].name} returned error")
 
         if not agent_results:
-            return await self._run_general(
+            result = await self._run_general(
                 query, conversation_history, config, mcp_client, all_tools
             )
+            result["thought_process"] = {
+                "classification": f"{', '.join(specialist_names)} (all failed, fallback to general)",
+                "reason": "All specialist agents failed",
+                "tool_calls": result.get("tool_calls_sequence", []),
+            }
+            result.pop("tool_calls_sequence", None)
+            return result
 
         if len(agent_results) == 1:
-            return agent_results[0].content
+            return {
+                "result": agent_results[0].content,
+                "agent": agent_results[0].agent_name,
+                "tools_used": agent_results[0].tools_called,
+                "thought_process": {
+                    "classification": agent_results[0].agent_name,
+                    "reason": f"Multi-agent routing ({', '.join(specialist_names)}), one succeeded",
+                    "tool_calls": agent_results[0].tool_calls_sequence,
+                },
+            }
 
         # Synthesize multiple agent results
-        return await self._synthesize(query, agent_results, config, mcp_client)
+        synthesized = await self._synthesize(query, agent_results, config, mcp_client)
+        return {
+            "result": synthesized,
+            "agent": " + ".join(agent_labels),
+            "tools_used": all_tools_used,
+            "thought_process": {
+                "classification": " + ".join(agent_labels),
+                "reason": f"Parallel execution of {len(agent_labels)} agents, then synthesis",
+                "tool_calls": all_tool_calls,
+            },
+        }
 
     async def _synthesize(
         self,
@@ -307,13 +384,19 @@ Synthesize these findings into a single comprehensive response."""
         config: AppConfig,
         mcp_client: MCPClient,
         all_tools: list[ToolDefinition],
-    ) -> str:
+    ) -> dict[str, Any]:
         """Run a general query with all available tools."""
         logger.info("Running general agent with all tools")
         provider = LLMProvider(config, mcp_client)
-        return await provider.run_agent_loop(
+        result, tools_used, calls_sequence = await provider.run_agent_loop(
             system_prompt=GENERAL_SYSTEM_PROMPT,
             user_query=query,
             tools=all_tools,
             conversation_history=conversation_history,
         )
+        return {
+            "result": result,
+            "agent": "general",
+            "tools_used": tools_used,
+            "tool_calls_sequence": calls_sequence,
+        }

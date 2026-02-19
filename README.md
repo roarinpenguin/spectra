@@ -167,7 +167,6 @@ Open your browser to **http://localhost:3000**
 1. Click the **⚙️ Settings** gear icon in the header
 2. Configure your **LLM Provider** and **API Key**
 3. Set the **MCP Server URL** (default: `http://host.docker.internal:8000`)
-4. Add your **S1 Destinations** in the second tab
 
 ---
 

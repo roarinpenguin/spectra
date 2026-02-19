@@ -294,7 +294,6 @@ Configuration is persisted in the `spectra-config` volume:
 - MCP Server URL
 - LLM Provider and API Key  
 - LLM Model selection
-- S1 Destinations (names, URLs, tokens)
 - Saved investigations
 
 ---

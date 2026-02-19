@@ -911,24 +911,25 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
               {/* LLM Model */}
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Model <span className="text-gray-500 text-xs">(type exact API model ID)</span>
+                  Model
                 </label>
-                <input
-                  type="text"
+                <select
                   value={formData.llm_model}
                   onChange={(e) => setFormData(prev => ({ ...prev, llm_model: e.target.value }))}
-                  placeholder="e.g., gpt-5.2-codex-medium"
-                  className="w-full px-4 py-3 glass rounded-xl bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500"
-                  list="model-suggestions"
-                />
-                <datalist id="model-suggestions">
-                  {currentModels.map((model) => (
-                    <option key={model} value={model} />
-                  ))}
-                </datalist>
-                <p className="text-xs text-gray-500 mt-1">
-                  Suggestions: {currentModels.slice(0, 3).join(', ')}...
-                </p>
+                  className="w-full px-4 py-3 glass rounded-xl bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white appearance-none cursor-pointer"
+                  style={{ backgroundImage: `url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%239CA3AF'%3E%3Cpath stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M19 9l-7 7-7-7'%3E%3C/path%3E%3C/svg%3E")`, backgroundRepeat: 'no-repeat', backgroundPosition: 'right 12px center', backgroundSize: '20px' }}
+                >
+                  {currentModels.length === 0 ? (
+                    <option value="">Select a provider first</option>
+                  ) : (
+                    <>
+                      <option value="">Select a model</option>
+                      {currentModels.map((model) => (
+                        <option key={model} value={model}>{model}</option>
+                      ))}
+                    </>
+                  )}
+                </select>
               </div>
 
               {/* Save Button */}

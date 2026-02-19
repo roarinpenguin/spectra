@@ -595,7 +595,7 @@ function MarkdownSection({ content, messageId }) {
     ),
   }
   return (
-    <div className="prose prose-invert prose-sm max-w-none">
+    <div className="prose prose-invert prose-sm max-w-none break-words overflow-hidden">
       <ReactMarkdown remarkPlugins={[remarkGfm]} components={mdComponents}>
         {content}
       </ReactMarkdown>
@@ -684,7 +684,7 @@ function Message({ message, isUser }) {
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} animate-slide-up`}>
       <div
-        className={`max-w-[80%] rounded-2xl px-5 py-4 ${
+        className={`max-w-[80%] rounded-2xl px-5 py-4 overflow-hidden break-words ${
           isUser
             ? 'bg-gradient-to-r from-purple-600 to-purple-500 text-white'
             : 'glass text-gray-100'
@@ -2215,7 +2215,7 @@ function App() {
             </div>
           ) : (
             /* Messages */
-            <div className="flex-1 overflow-y-auto p-6 space-y-4">
+            <div className="flex-1 overflow-y-auto overflow-x-hidden p-6 space-y-4">
               {messages.map((msg) => (
                 <Message key={msg.id} message={msg} isUser={msg.isUser} />
               ))}
@@ -2263,7 +2263,7 @@ function App() {
             Powered by <span className="text-purple-400">SentinelOne</span> Purple AI + MCP
           </p>
           <p className="text-xs text-gray-600 flex items-center gap-1">
-            Crafted with <Heart className="w-3 h-3 text-purple-500" /> by <span className="text-purple-400">Roarinpenguin</span>
+            Crafted with <Heart className="w-3 h-3 text-purple-500" /> by <span className="text-purple-400 cursor-help relative group">The AI Chef Brigade<span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg opacity-0 group-hover:opacity-100 transition-opacity duration-200 whitespace-nowrap pointer-events-none border border-purple-500/30">Who is The AI Chef Brigade? Nate Smalley and Marco Rottigni a.k.a. The RoarinPenguin</span></span>
           </p>
         </div>
       </footer>

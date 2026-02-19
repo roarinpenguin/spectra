@@ -319,5 +319,5 @@ MIT License - See [LICENSE](LICENSE) for details.
 ---
 
 <p align="center">
-  Crafted with 💜 by <a href="https://github.com/roarinpenguin-s1">Roarinpenguin</a>
+  Crafted with 💜 by The AI Chef Brigade (Nate Smalley and Marco Rottigni a.k.a. The RoarinPenguin)
 </p>

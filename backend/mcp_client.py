@@ -95,6 +95,10 @@ class MCPClient:
             )
 
     async def call_tool(self, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        # Log the tool call with full arguments for debugging
+        logger.info(f"MCP tool call: {tool_name}")
+        logger.info(f"MCP tool arguments: {json.dumps(arguments, indent=2)}")
+        
         async with httpx.AsyncClient(timeout=120.0) as client:
             if not self.session_id:
                 init_result = await self.initialize()

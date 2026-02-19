@@ -34,6 +34,79 @@ import remarkGfm from 'remark-gfm'
 import { jsPDF } from 'jspdf'
 import html2canvas from 'html2canvas'
 import { PieChart, Pie, Cell, BarChart, Bar, XAxis, YAxis, Tooltip, ResponsiveContainer, Legend } from 'recharts'
+import mermaid from 'mermaid'
+
+// Initialize mermaid with dark theme
+mermaid.initialize({
+  startOnLoad: false,
+  theme: 'dark',
+  themeVariables: {
+    primaryColor: '#7C3AED',
+    primaryTextColor: '#F3F4F6',
+    primaryBorderColor: '#5B21B6',
+    lineColor: '#9CA3AF',
+    secondaryColor: '#4C1D95',
+    tertiaryColor: '#1F2937',
+    background: '#111827',
+    mainBkg: '#1F2937',
+    nodeBorder: '#7C3AED',
+    clusterBkg: '#1F2937',
+    titleColor: '#E9D5FF',
+    edgeLabelBackground: '#1F2937',
+  },
+  fontFamily: 'ui-sans-serif, system-ui, sans-serif',
+})
+
+// Generic Mermaid diagram renderer using mermaid.js
+function MermaidDiagram({ content, chartId }) {
+  const containerRef = useRef(null)
+  const [svgContent, setSvgContent] = useState(null)
+  const [error, setError] = useState(null)
+
+  useEffect(() => {
+    const renderDiagram = async () => {
+      if (!content || !containerRef.current) return
+      
+      try {
+        // Generate unique ID for this render
+        const id = `mermaid-${chartId}-${Date.now()}`
+        const { svg } = await mermaid.render(id, content.trim())
+        setSvgContent(svg)
+        setError(null)
+      } catch (err) {
+        console.error('Mermaid render error:', err)
+        setError(err.message || 'Failed to render diagram')
+      }
+    }
+    
+    renderDiagram()
+  }, [content, chartId])
+
+  if (error) {
+    return (
+      <div className="my-4 bg-red-900/20 border border-red-500/30 rounded-xl p-4">
+        <p className="text-red-400 text-sm mb-2">Failed to render Mermaid diagram</p>
+        <pre className="bg-black/40 p-3 rounded-lg text-xs overflow-x-auto text-gray-300">{content}</pre>
+      </div>
+    )
+  }
+
+  return (
+    <div 
+      ref={containerRef}
+      className="my-4 bg-white/5 rounded-xl p-4 overflow-x-auto"
+      data-chart-id={chartId}
+      dangerouslySetInnerHTML={svgContent ? { __html: svgContent } : undefined}
+    >
+      {!svgContent && (
+        <div className="flex items-center justify-center py-8">
+          <Loader2 className="w-6 h-6 animate-spin text-purple-400" />
+          <span className="ml-2 text-gray-400">Rendering diagram...</span>
+        </div>
+      )}
+    </div>
+  )
+}
 
 // SPECTRA Logo - Converging data streams forming unified insight
 function SpectraLogo({ className = "w-10 h-10" }) {
@@ -553,12 +626,26 @@ function splitIntoSections(content) {
 }
 
 function MarkdownSection({ content, messageId }) {
+  // Detect if content looks like a Mermaid diagram
+  const isMermaidContent = (text) => {
+    const trimmed = text.trim()
+    const mermaidKeywords = ['pie', 'graph', 'flowchart', 'sequenceDiagram', 'classDiagram', 
+      'stateDiagram', 'erDiagram', 'gantt', 'journey', 'gitGraph', 'mindmap', 'timeline',
+      'xychart-beta', 'sankey-beta', 'quadrantChart', 'requirementDiagram', 'C4Context']
+    return mermaidKeywords.some(kw => trimmed.startsWith(kw))
+  }
+
   const mdComponents = {
     code: ({node, inline, className, children, ...props}) => {
       const text = String(children).replace(/\n$/, '')
-      // Detect Mermaid pie chart syntax
-      if (!inline && (className === 'language-mermaid' || text.trim().startsWith('pie'))) {
-        return <MermaidPieChart content={text} chartId={`mermaid-${messageId}`} />
+      // Detect Mermaid syntax - use mermaid.js for all diagram types
+      if (!inline && (className === 'language-mermaid' || isMermaidContent(text))) {
+        // Use custom pie chart renderer for pie charts (better styling with recharts)
+        if (text.trim().startsWith('pie')) {
+          return <MermaidPieChart content={text} chartId={`mermaid-${messageId}`} />
+        }
+        // Use mermaid.js for all other diagram types
+        return <MermaidDiagram content={text} chartId={`mermaid-${messageId}-${Date.now()}`} />
       }
       // Short single-line code blocks → render as inline code (fixes LLM triple-backtick issue)
       if (!inline && !text.includes('\n') && text.length < 120 && !className) {
@@ -575,7 +662,7 @@ function MarkdownSection({ content, messageId }) {
       return <code className="bg-purple-900/40 px-1.5 py-0.5 rounded text-purple-200" {...props}>{children}</code>
     },
     pre: ({node, children, ...props}) => {
-      if (children?.type === MermaidPieChart) return children
+      if (children?.type === MermaidPieChart || children?.type === MermaidDiagram) return children
       return <>{children}</>
     },
     table: ({node, children, ...props}) => (

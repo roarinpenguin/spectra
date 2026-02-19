@@ -178,7 +178,7 @@ You can pre-configure SPECTRA using environment variables before running Docker:
 export MCP_SERVER_URL=http://host.docker.internal:8000
 export OPENAI_API_KEY=sk-...
 export LLM_PROVIDER=openai
-export LLM_MODEL=gpt-4o
+export LLM_MODEL=gpt-5.2
 
 docker compose up --build -d
 ```

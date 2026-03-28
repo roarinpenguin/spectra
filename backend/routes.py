@@ -13,15 +13,18 @@ import httpx
 from fastapi import APIRouter, HTTPException, Request
 
 from agents.orchestrator import Orchestrator
-from config import config, load_investigations, log_buffer, logger, save_investigations
+from config import config, load_destinations, load_investigations, log_buffer, logger, save_destinations, save_investigations
 from mcp_client import extract_mcp_result, get_mcp_client, reset_mcp_client
 from metrics import Timer, metrics
 from models import (
     ConfigUpdateRequest,
+    CreateDestinationRequest,
+    Destination,
     Investigation,
     QueryRequest,
     SaveInvestigationRequest,
     ToolRequest,
+    UpdateDestinationRequest,
 )
 from streaming import create_streaming_response, AgentStream, wants_streaming
 
@@ -456,6 +459,204 @@ async def delete_investigation(investigation_id: str) -> dict[str, Any]:
         return {"status": "success", "message": "Investigation deleted"}
     else:
         raise HTTPException(status_code=500, detail="Failed to delete investigation")
+
+
+# ---------------------------------------------------------------------------
+# Destinations (Multi-Console)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/destinations")
+async def list_destinations() -> dict[str, Any]:
+    """List all configured console destinations."""
+    destinations = load_destinations()
+    dest_list = sorted(
+        [d.model_dump() for d in destinations.values()],
+        key=lambda x: x["updated_at"],
+        reverse=True,
+    )
+    # Mask API tokens in response
+    for d in dest_list:
+        if d.get("api_token"):
+            d["api_token_preview"] = d["api_token"][:8] + "..." if len(d["api_token"]) > 8 else "****"
+            d["api_token_set"] = True
+        else:
+            d["api_token_preview"] = ""
+            d["api_token_set"] = False
+        del d["api_token"]
+    return {"status": "success", "destinations": dest_list, "count": len(dest_list)}
+
+
+@router.get("/api/destinations/active")
+async def get_active_destination() -> dict[str, Any]:
+    """Get the currently active destination."""
+    destinations = load_destinations()
+    for d in destinations.values():
+        if d.is_active:
+            result = d.model_dump()
+            # Mask token
+            if result.get("api_token"):
+                result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else "****"
+                result["api_token_set"] = True
+            else:
+                result["api_token_preview"] = ""
+                result["api_token_set"] = False
+            del result["api_token"]
+            return {"status": "success", "destination": result}
+    return {"status": "success", "destination": None}
+
+
+@router.post("/api/destinations")
+async def create_destination(request: CreateDestinationRequest) -> dict[str, Any]:
+    """Create a new console destination."""
+    destinations = load_destinations()
+    now = datetime.utcnow().isoformat() + "Z"
+    dest_id = str(uuid.uuid4())[:8]
+
+    # If this is the first destination, make it active
+    is_first = len(destinations) == 0
+
+    destination = Destination(
+        id=dest_id,
+        name=request.name,
+        console_url=request.console_url,
+        api_token=request.api_token,
+        mcp_server_url=request.mcp_server_url,
+        is_active=is_first,
+        last_used=now if is_first else None,
+        created_at=now,
+        updated_at=now,
+    )
+
+    destinations[dest_id] = destination
+
+    if save_destinations(destinations):
+        logger.info(f"Destination created: {dest_id} - {request.name}")
+        # If first destination, activate it (update MCP client)
+        if is_first:
+            config.mcp_server_url = request.mcp_server_url
+            config.save_to_file()
+            reset_mcp_client(request.mcp_server_url)
+            logger.info(f"Auto-activated first destination: {request.name}")
+
+        result = destination.model_dump()
+        result["api_token_set"] = bool(result["api_token"])
+        result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
+        del result["api_token"]
+        return {"status": "success", "message": "Destination created", "destination": result}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to save destination")
+
+
+@router.put("/api/destinations/{dest_id}")
+async def update_destination(dest_id: str, request: UpdateDestinationRequest) -> dict[str, Any]:
+    """Update an existing destination."""
+    destinations = load_destinations()
+    if dest_id not in destinations:
+        raise HTTPException(status_code=404, detail="Destination not found")
+
+    dest = destinations[dest_id]
+    now = datetime.utcnow().isoformat() + "Z"
+    changes = []
+
+    if request.name is not None and request.name != dest.name:
+        dest.name = request.name
+        changes.append("name")
+    if request.console_url is not None and request.console_url != dest.console_url:
+        dest.console_url = request.console_url
+        changes.append("console_url")
+    if request.api_token is not None and request.api_token != "":
+        dest.api_token = request.api_token
+        changes.append("api_token")
+    if request.mcp_server_url is not None and request.mcp_server_url != dest.mcp_server_url:
+        dest.mcp_server_url = request.mcp_server_url
+        changes.append("mcp_server_url")
+        # If this is the active destination, update the MCP client
+        if dest.is_active:
+            config.mcp_server_url = request.mcp_server_url
+            config.save_to_file()
+            reset_mcp_client(request.mcp_server_url)
+
+    if changes:
+        dest.updated_at = now
+        destinations[dest_id] = dest
+        if save_destinations(destinations):
+            logger.info(f"Destination updated: {dest_id} - changed: {', '.join(changes)}")
+            result = dest.model_dump()
+            result["api_token_set"] = bool(result["api_token"])
+            result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
+            del result["api_token"]
+            return {"status": "success", "message": f"Updated: {', '.join(changes)}", "destination": result}
+        else:
+            raise HTTPException(status_code=500, detail="Failed to save destination")
+
+    return {"status": "success", "message": "No changes"}
+
+
+@router.delete("/api/destinations/{dest_id}")
+async def delete_destination(dest_id: str) -> dict[str, Any]:
+    """Delete a destination."""
+    destinations = load_destinations()
+    if dest_id not in destinations:
+        raise HTTPException(status_code=404, detail="Destination not found")
+
+    was_active = destinations[dest_id].is_active
+    name = destinations[dest_id].name
+    del destinations[dest_id]
+
+    # If deleted destination was active, activate the most recently used one
+    if was_active and destinations:
+        remaining = sorted(
+            destinations.values(),
+            key=lambda d: d.last_used or d.created_at,
+            reverse=True,
+        )
+        remaining[0].is_active = True
+        remaining[0].last_used = datetime.utcnow().isoformat() + "Z"
+        config.mcp_server_url = remaining[0].mcp_server_url
+        config.save_to_file()
+        reset_mcp_client(remaining[0].mcp_server_url)
+        logger.info(f"Auto-activated destination: {remaining[0].name}")
+
+    if save_destinations(destinations):
+        logger.info(f"Destination deleted: {dest_id} - {name}")
+        return {"status": "success", "message": "Destination deleted"}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to delete destination")
+
+
+@router.post("/api/destinations/{dest_id}/activate")
+async def activate_destination(dest_id: str) -> dict[str, Any]:
+    """Set a destination as the active one and switch MCP connection."""
+    destinations = load_destinations()
+    if dest_id not in destinations:
+        raise HTTPException(status_code=404, detail="Destination not found")
+
+    now = datetime.utcnow().isoformat() + "Z"
+
+    # Deactivate all, activate the selected one
+    for d in destinations.values():
+        d.is_active = False
+
+    dest = destinations[dest_id]
+    dest.is_active = True
+    dest.last_used = now
+    dest.updated_at = now
+    destinations[dest_id] = dest
+
+    if save_destinations(destinations):
+        # Switch MCP client to this destination
+        config.mcp_server_url = dest.mcp_server_url
+        config.save_to_file()
+        reset_mcp_client(dest.mcp_server_url)
+        logger.info(f"Activated destination: {dest.name} ({dest.mcp_server_url})")
+
+        result = dest.model_dump()
+        result["api_token_set"] = bool(result["api_token"])
+        result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
+        del result["api_token"]
+        return {"status": "success", "message": f"Switched to {dest.name}", "destination": result}
+    else:
+        raise HTTPException(status_code=500, detail="Failed to save destination")
 
 
 # ---------------------------------------------------------------------------

@@ -28,6 +28,8 @@ import {
   FolderOpen,
   Clock,
   Tag,
+  Globe,
+  ChevronUp,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
@@ -851,9 +853,9 @@ function ExampleCard({ query, onClick }) {
   )
 }
 
-function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
+function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, destinations, onDestinationsChange }) {
+  const [activeTab, setActiveTab] = useState('consoles')
   const [formData, setFormData] = useState({
-    mcp_server_url: settings?.mcp_server_url || '',
     llm_provider: settings?.llm_provider || 'anthropic',
     llm_api_key: '',
     llm_model: settings?.llm_model || '',
@@ -862,16 +864,27 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
   const [message, setMessage] = useState(null)
   const [showLogs, setShowLogs] = useState(false)
 
+  // Destination form state
+  const [showDestForm, setShowDestForm] = useState(false)
+  const [editingDest, setEditingDest] = useState(null)
+  const [destForm, setDestForm] = useState({ name: '', console_url: '', api_token: '', mcp_server_url: '' })
+
   useEffect(() => {
     if (settings) {
       setFormData(prev => ({
         ...prev,
-        mcp_server_url: settings.mcp_server_url || '',
         llm_provider: settings.llm_provider || 'anthropic',
         llm_model: settings.llm_model || '',
       }))
     }
   }, [settings])
+
+  // Auto-switch to consoles tab if no destinations
+  useEffect(() => {
+    if (isOpen && destinations.length === 0) {
+      setActiveTab('consoles')
+    }
+  }, [isOpen, destinations.length])
 
   const handleProviderChange = (provider) => {
     setFormData(prev => ({
@@ -881,14 +894,11 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
     }))
   }
 
-  const handleSave = async () => {
+  const handleSaveLLM = async () => {
     setIsSaving(true)
     setMessage(null)
     try {
       const payload = {}
-      if (formData.mcp_server_url !== settings?.mcp_server_url) {
-        payload.mcp_server_url = formData.mcp_server_url
-      }
       if (formData.llm_provider !== settings?.llm_provider) {
         payload.llm_provider = formData.llm_provider
       }
@@ -920,6 +930,74 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
     }
   }
 
+  const resetDestForm = () => {
+    setDestForm({ name: '', console_url: '', api_token: '', mcp_server_url: '' })
+    setEditingDest(null)
+    setShowDestForm(false)
+  }
+
+  const handleSaveDest = async () => {
+    if (!destForm.name.trim() || !destForm.console_url.trim() || !destForm.mcp_server_url.trim()) {
+      setMessage({ type: 'error', text: 'Name, Console URL, and MCP Server URL are required' })
+      return
+    }
+    setIsSaving(true)
+    setMessage(null)
+    try {
+      let response
+      if (editingDest) {
+        response = await fetch(`/api/destinations/${editingDest}`, {
+          method: 'PUT',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(destForm),
+        })
+      } else {
+        response = await fetch('/api/destinations', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(destForm),
+        })
+      }
+      const data = await response.json()
+      if (data.status === 'success') {
+        setMessage({ type: 'success', text: data.message })
+        resetDestForm()
+        onDestinationsChange()
+      } else {
+        setMessage({ type: 'error', text: data.detail || 'Failed to save' })
+      }
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    } finally {
+      setIsSaving(false)
+    }
+  }
+
+  const handleDeleteDest = async (id, name) => {
+    if (!confirm(`Delete console "${name}"?`)) return
+    try {
+      const response = await fetch(`/api/destinations/${id}`, { method: 'DELETE' })
+      const data = await response.json()
+      if (data.status === 'success') {
+        setMessage({ type: 'success', text: 'Console deleted' })
+        onDestinationsChange()
+      }
+    } catch (error) {
+      setMessage({ type: 'error', text: error.message })
+    }
+  }
+
+  const handleEditDest = (dest) => {
+    setEditingDest(dest.id)
+    setDestForm({
+      name: dest.name,
+      console_url: dest.console_url,
+      api_token: '',
+      mcp_server_url: dest.mcp_server_url,
+    })
+    setShowDestForm(true)
+  }
+
   if (!isOpen) return null
 
   const currentModels = availableModels?.[formData.llm_provider] || []
@@ -935,22 +1013,186 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto">
-          <div className="space-y-5">
-              {/* MCP Server URL */}
-              <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  MCP Server URL
-                </label>
-                <input
-                  type="text"
-                  value={formData.mcp_server_url}
-                  onChange={(e) => setFormData(prev => ({ ...prev, mcp_server_url: e.target.value }))}
-                  placeholder="http://localhost:10000"
-                  className="w-full px-4 py-3 glass rounded-xl bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500"
-                />
-              </div>
+        {/* Tabs */}
+        <div className="flex gap-2 mb-4">
+          <button
+            onClick={() => setActiveTab('consoles')}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-smooth flex items-center gap-2 ${
+              activeTab === 'consoles' ? 'bg-purple-600/30 text-white border border-purple-500/50' : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <Globe className="w-4 h-4" />
+            Consoles
+            <span className="text-xs opacity-60">({destinations.length})</span>
+          </button>
+          <button
+            onClick={() => setActiveTab('llm')}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-smooth flex items-center gap-2 ${
+              activeTab === 'llm' ? 'bg-purple-600/30 text-white border border-purple-500/50' : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <Sparkles className="w-4 h-4" />
+            LLM Configuration
+          </button>
+        </div>
 
+        <div className="flex-1 overflow-y-auto">
+          {/* === Consoles Tab === */}
+          {activeTab === 'consoles' && (
+            <div className="space-y-4">
+              {/* Add / Edit form */}
+              {!showDestForm ? (
+                <button
+                  onClick={() => { resetDestForm(); setShowDestForm(true) }}
+                  className="w-full flex items-center justify-center gap-2 py-3 glass rounded-xl border border-dashed border-purple-500/30 text-purple-400 hover:bg-purple-500/10 hover:border-purple-500/50 transition-smooth"
+                >
+                  <Plus className="w-4 h-4" />
+                  Add Console
+                </button>
+              ) : (
+                <div className="glass rounded-xl p-4 border border-purple-500/30 space-y-3">
+                  <h3 className="text-sm font-medium text-purple-300">
+                    {editingDest ? 'Edit Console' : 'New Console'}
+                  </h3>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Display Name *</label>
+                    <input
+                      type="text"
+                      value={destForm.name}
+                      onChange={(e) => setDestForm(prev => ({ ...prev, name: e.target.value }))}
+                      placeholder="e.g. Production, Lab, Demo"
+                      className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">SentinelOne Console URL *</label>
+                    <input
+                      type="text"
+                      value={destForm.console_url}
+                      onChange={(e) => setDestForm(prev => ({ ...prev, console_url: e.target.value }))}
+                      placeholder="https://your-console.sentinelone.net"
+                      className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">
+                      API Token
+                      {editingDest && destinations.find(d => d.id === editingDest)?.api_token_set && (
+                        <span className="text-green-400 ml-2">✓ Set</span>
+                      )}
+                    </label>
+                    <input
+                      type="password"
+                      value={destForm.api_token}
+                      onChange={(e) => setDestForm(prev => ({ ...prev, api_token: e.target.value }))}
+                      placeholder={editingDest ? "Leave blank to keep current..." : "SentinelOne API token"}
+                      className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs text-gray-400 mb-1">Purple MCP Server URL *</label>
+                    <input
+                      type="text"
+                      value={destForm.mcp_server_url}
+                      onChange={(e) => setDestForm(prev => ({ ...prev, mcp_server_url: e.target.value }))}
+                      placeholder="http://host.docker.internal:8000"
+                      className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+                    />
+                  </div>
+                  <div className="flex gap-2 pt-1">
+                    <button
+                      onClick={handleSaveDest}
+                      disabled={isSaving}
+                      className="px-4 py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-smooth flex items-center gap-2 text-sm"
+                    >
+                      {isSaving ? <Loader2 className="w-4 h-4 animate-spin" /> : <Check className="w-4 h-4" />}
+                      {editingDest ? 'Update' : 'Add'}
+                    </button>
+                    <button
+                      onClick={resetDestForm}
+                      className="px-4 py-2 glass hover:bg-white/10 text-gray-300 rounded-lg transition-smooth text-sm"
+                    >
+                      Cancel
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {/* Destinations list */}
+              {destinations.length === 0 ? (
+                <div className="text-center py-8 text-gray-500">
+                  <Globe className="w-12 h-12 mx-auto mb-3 opacity-30" />
+                  <p>No consoles configured</p>
+                  <p className="text-sm mt-1">Add a SentinelOne console to get started</p>
+                </div>
+              ) : (
+                <div className="space-y-2">
+                  {destinations.map((dest) => (
+                    <div
+                      key={dest.id}
+                      className={`glass p-4 rounded-xl transition-smooth group ${
+                        dest.is_active ? 'border border-purple-500/40 bg-purple-500/5' : 'hover:bg-white/5'
+                      }`}
+                    >
+                      <div className="flex items-start justify-between">
+                        <div className="flex-1 min-w-0">
+                          <div className="flex items-center gap-2">
+                            <h4 className="font-medium text-white truncate">{dest.name}</h4>
+                            {dest.is_active && (
+                              <span className="px-2 py-0.5 text-[10px] font-semibold bg-purple-500/20 text-purple-300 rounded-full border border-purple-500/30 uppercase tracking-wide">
+                                Active
+                              </span>
+                            )}
+                          </div>
+                          <p className="text-xs text-gray-400 mt-1 truncate flex items-center gap-1">
+                            <Globe className="w-3 h-3 flex-shrink-0" />
+                            {dest.console_url}
+                          </p>
+                          <p className="text-xs text-gray-500 mt-0.5 truncate flex items-center gap-1">
+                            <Server className="w-3 h-3 flex-shrink-0" />
+                            {dest.mcp_server_url}
+                          </p>
+                          <div className="flex items-center gap-3 mt-1.5 text-[11px] text-gray-600">
+                            {dest.api_token_set && (
+                              <span className="flex items-center gap-1 text-green-500">
+                                <Key className="w-3 h-3" /> Token set
+                              </span>
+                            )}
+                            {dest.last_used && (
+                              <span className="flex items-center gap-1">
+                                <Clock className="w-3 h-3" />
+                                Last used: {new Date(dest.last_used).toLocaleDateString()}
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1 ml-3 opacity-0 group-hover:opacity-100 transition-smooth">
+                          <button
+                            onClick={() => handleEditDest(dest)}
+                            className="p-1.5 hover:bg-white/10 rounded-lg transition-smooth text-gray-400 hover:text-purple-400"
+                            title="Edit"
+                          >
+                            <Edit2 className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => handleDeleteDest(dest.id, dest.name)}
+                            className="p-1.5 hover:bg-red-500/20 rounded-lg transition-smooth text-gray-400 hover:text-red-400"
+                            title="Delete"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* === LLM Tab === */}
+          {activeTab === 'llm' && (
+            <div className="space-y-5">
               {/* LLM Provider */}
               <div>
                 <label className="block text-sm font-medium text-gray-300 mb-2">
@@ -1021,7 +1263,7 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
 
               {/* Save Button */}
               <button
-                onClick={handleSave}
+                onClick={handleSaveLLM}
                 disabled={isSaving}
                 className="w-full py-3 bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 rounded-xl font-medium transition-smooth flex items-center justify-center gap-2 disabled:opacity-50"
               >
@@ -1030,11 +1272,12 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels }) {
                 ) : (
                   <>
                     <Check className="w-5 h-5" />
-                    Save Settings
+                    Save LLM Settings
                   </>
                 )}
               </button>
             </div>
+          )}
         </div>
 
         {/* Message */}
@@ -1479,11 +1722,17 @@ function App() {
   const [currentInvestigationId, setCurrentInvestigationId] = useState(null)
   const [settings, setSettings] = useState(null)
   const [availableModels, setAvailableModels] = useState({})
+  const [destinations, setDestinations] = useState([])
+  const [activeDestination, setActiveDestination] = useState(null)
+  const [destinationsLoaded, setDestinationsLoaded] = useState(false)
+  const [showConsoleSelector, setShowConsoleSelector] = useState(false)
+  const consoleSelectorRef = useRef(null)
   const messagesEndRef = useRef(null)
 
-  // Load settings and check MCP server connection on load
+  // Load settings, destinations, and check MCP server connection on load
   useEffect(() => {
     loadSettings()
+    loadDestinations()
     checkMcpHealth()
   }, [])
 
@@ -1506,6 +1755,59 @@ function App() {
       console.error('Failed to load settings:', error)
     }
   }
+
+  const loadDestinations = async () => {
+    try {
+      const response = await fetch('/api/destinations')
+      const data = await response.json()
+      if (data.status === 'success') {
+        setDestinations(data.destinations)
+        const active = data.destinations.find(d => d.is_active)
+        setActiveDestination(active || null)
+      }
+    } catch (error) {
+      console.error('Failed to load destinations:', error)
+    } finally {
+      setDestinationsLoaded(true)
+    }
+  }
+
+  const switchDestination = async (destId) => {
+    try {
+      const response = await fetch(`/api/destinations/${destId}/activate`, { method: 'POST' })
+      const data = await response.json()
+      if (data.status === 'success') {
+        await loadDestinations()
+        checkMcpHealth()
+        // Clear messages when switching consoles for clean context
+        setMessages([])
+        setCurrentInvestigationId(null)
+      }
+    } catch (error) {
+      console.error('Failed to switch destination:', error)
+    }
+    setShowConsoleSelector(false)
+  }
+
+  // Auto-open settings if no destinations are configured
+  useEffect(() => {
+    if (destinationsLoaded && destinations.length === 0) {
+      setShowSettings(true)
+    }
+  }, [destinationsLoaded, destinations.length])
+
+  // Close console selector when clicking outside
+  useEffect(() => {
+    const handleClickOutside = (e) => {
+      if (consoleSelectorRef.current && !consoleSelectorRef.current.contains(e.target)) {
+        setShowConsoleSelector(false)
+      }
+    }
+    if (showConsoleSelector) {
+      document.addEventListener('mousedown', handleClickOutside)
+      return () => document.removeEventListener('mousedown', handleClickOutside)
+    }
+  }, [showConsoleSelector])
 
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
@@ -2147,28 +2449,98 @@ function App() {
           </div>
 
           <div className="flex items-center gap-4">
-            <div className={`flex items-center gap-2 px-3 py-1.5 glass rounded-full text-xs ${
-              isConnected ? '' : 'border border-red-500/30'
-            }`}>
-              {isConnected ? (
-                <>
-                  <Wifi className="w-4 h-4 text-green-400" />
-                  <span className="text-gray-300">
-                    {mcpStatus.server_name || 'MCP'} Connected
-                    {mcpStatus.console_url && (
-                      <span className="text-purple-400 ml-1">
-                        → {mcpStatus.console_url.replace('https://', '').split('.')[0]}
-                      </span>
-                    )}
+            {/* Console Selector */}
+            {destinations.length > 0 && (
+              <div className="relative" ref={consoleSelectorRef}>
+                <button
+                  onClick={() => setShowConsoleSelector(!showConsoleSelector)}
+                  className={`flex items-center gap-2 px-3 py-1.5 glass rounded-full text-xs transition-smooth hover:bg-white/10 ${
+                    isConnected ? '' : 'border border-red-500/30'
+                  }`}
+                >
+                  {isConnected ? (
+                    <Wifi className="w-3.5 h-3.5 text-green-400" />
+                  ) : (
+                    <WifiOff className="w-3.5 h-3.5 text-red-400" />
+                  )}
+                  <Globe className="w-3.5 h-3.5 text-purple-400" />
+                  <span className="text-gray-300 max-w-[180px] truncate">
+                    {activeDestination?.name || 'No Console'}
                   </span>
-                </>
-              ) : (
-                <>
-                  <WifiOff className="w-4 h-4 text-red-400" />
-                  <span className="text-red-400">MCP Disconnected</span>
-                </>
-              )}
-            </div>
+                  {showConsoleSelector ? (
+                    <ChevronUp className="w-3.5 h-3.5 text-gray-500" />
+                  ) : (
+                    <ChevronDown className="w-3.5 h-3.5 text-gray-500" />
+                  )}
+                </button>
+
+                {/* Dropdown */}
+                {showConsoleSelector && (
+                  <div className="absolute right-0 top-full mt-2 w-72 glass-darker rounded-xl border border-white/10 shadow-2xl overflow-hidden z-50 animate-slide-up">
+                    <div className="px-3 py-2 border-b border-white/5">
+                      <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Switch Console</p>
+                    </div>
+                    <div className="max-h-64 overflow-y-auto">
+                      {destinations.map((dest) => (
+                        <button
+                          key={dest.id}
+                          onClick={() => dest.is_active ? setShowConsoleSelector(false) : switchDestination(dest.id)}
+                          className={`w-full text-left px-3 py-2.5 flex items-start gap-2.5 transition-smooth ${
+                            dest.is_active
+                              ? 'bg-purple-500/10 border-l-2 border-purple-500'
+                              : 'hover:bg-white/5 border-l-2 border-transparent'
+                          }`}
+                        >
+                          <Globe className={`w-4 h-4 mt-0.5 flex-shrink-0 ${dest.is_active ? 'text-purple-400' : 'text-gray-500'}`} />
+                          <div className="flex-1 min-w-0">
+                            <div className="flex items-center gap-2">
+                              <span className={`text-sm font-medium truncate ${dest.is_active ? 'text-white' : 'text-gray-300'}`}>
+                                {dest.name}
+                              </span>
+                              {dest.is_active && (
+                                <Check className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
+                              )}
+                            </div>
+                            <p className="text-[11px] text-gray-500 truncate">{dest.console_url}</p>
+                          </div>
+                        </button>
+                      ))}
+                    </div>
+                    <div className="px-3 py-2 border-t border-white/5">
+                      <button
+                        onClick={() => { setShowConsoleSelector(false); setShowSettings(true) }}
+                        className="flex items-center gap-2 text-xs text-purple-400 hover:text-purple-300 transition-smooth"
+                      >
+                        <Settings className="w-3.5 h-3.5" />
+                        Manage Consoles
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Connection status (when no destinations) */}
+            {destinations.length === 0 && (
+              <div className={`flex items-center gap-2 px-3 py-1.5 glass rounded-full text-xs ${
+                isConnected ? '' : 'border border-red-500/30'
+              }`}>
+                {isConnected ? (
+                  <>
+                    <Wifi className="w-4 h-4 text-green-400" />
+                    <span className="text-gray-300">
+                      {mcpStatus.server_name || 'MCP'} Connected
+                    </span>
+                  </>
+                ) : (
+                  <>
+                    <WifiOff className="w-4 h-4 text-red-400" />
+                    <span className="text-red-400">MCP Disconnected</span>
+                  </>
+                )}
+              </div>
+            )}
+
             <button
               onClick={checkMcpHealth}
               disabled={isCheckingStatus}
@@ -2213,6 +2585,11 @@ function App() {
           checkMcpHealth()
         }}
         availableModels={availableModels}
+        destinations={destinations}
+        onDestinationsChange={() => {
+          loadDestinations()
+          checkMcpHealth()
+        }}
       />
 
       {/* Investigation Library Modal */}
@@ -2290,6 +2667,12 @@ function App() {
                 <p className="text-gray-400 max-w-md mx-auto">
                   I can analyze alerts, investigate threats, check vulnerabilities, and help you understand your security posture.
                 </p>
+                {activeDestination && (
+                  <div className="flex items-center justify-center gap-2 mt-3 text-xs text-purple-400/60">
+                    <Globe className="w-3.5 h-3.5" />
+                    <span>Connected to <span className="text-purple-400">{activeDestination.name}</span></span>
+                  </div>
+                )}
               </div>
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3 max-w-4xl w-full">
                 {EXAMPLE_QUERIES.map((ex, i) => (

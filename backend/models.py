@@ -85,3 +85,32 @@ class AgentResponse(BaseModel):
     tools_called: list[str] = Field(default_factory=list)
     tool_calls_sequence: list[dict] = Field(default_factory=list)
     is_error: bool = False
+
+
+class Destination(BaseModel):
+    """A configured SentinelOne console destination."""
+    id: str = Field(..., description="Unique destination ID")
+    name: str = Field(..., description="Display name for this console")
+    console_url: str = Field(..., description="SentinelOne console base URL")
+    api_token: str = Field(default="", description="SentinelOne API token")
+    mcp_server_url: str = Field(..., description="Purple MCP server URL for this console")
+    is_active: bool = Field(default=False, description="Whether this is the active destination")
+    last_used: Optional[str] = Field(default=None, description="ISO timestamp of last use")
+    created_at: str = Field(..., description="Creation timestamp")
+    updated_at: str = Field(..., description="Last update timestamp")
+
+
+class CreateDestinationRequest(BaseModel):
+    """Request to create a new destination."""
+    name: str = Field(..., description="Display name")
+    console_url: str = Field(..., description="SentinelOne console base URL")
+    api_token: str = Field(default="", description="SentinelOne API token")
+    mcp_server_url: str = Field(..., description="Purple MCP server URL")
+
+
+class UpdateDestinationRequest(BaseModel):
+    """Request to update a destination."""
+    name: Optional[str] = Field(None, description="Display name")
+    console_url: Optional[str] = Field(None, description="SentinelOne console base URL")
+    api_token: Optional[str] = Field(None, description="SentinelOne API token")
+    mcp_server_url: Optional[str] = Field(None, description="Purple MCP server URL")

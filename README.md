@@ -16,6 +16,10 @@
 
 SPECTRA is an AI-powered security investigation assistant that provides SOC analysts with a conversational interface to query, correlate, and analyze security data from SentinelOne. It leverages the power of Large Language Models (LLMs) combined with SentinelOne's Purple AI and the Model Context Protocol (MCP) to deliver intelligent, context-aware security insights.
 
+<p align="center">
+  <img src="assets/spectra_sample.png" alt="SPECTRA Logo">
+</p>
+
 ### What Can SPECTRA Do?
 
 - **Natural Language Threat Hunting**: Ask questions like *"Show me critical alerts from the last 24 hours"* or *"What vulnerabilities affect my production servers?"*

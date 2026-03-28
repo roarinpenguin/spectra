@@ -37,6 +37,7 @@ logger.setLevel(logging.INFO)
 # Configuration file paths
 CONFIG_FILE = os.getenv("CONFIG_FILE", "/app/config/settings.json")
 INVESTIGATIONS_FILE = os.getenv("INVESTIGATIONS_FILE", "/app/config/investigations.json")
+DESTINATIONS_FILE = os.getenv("DESTINATIONS_FILE", "/app/config/destinations.json")
 
 
 class AppConfig:
@@ -124,4 +125,33 @@ def save_investigations(investigations) -> bool:
         return True
     except Exception as e:
         logger.error(f"Failed to save investigations: {e}")
+        return False
+
+
+def load_destinations() -> dict[str, Any]:
+    """Load destinations from persistent file.
+
+    Returns:
+        Dict mapping destination ID to Destination model instance.
+    """
+    from models import Destination
+    try:
+        if os.path.exists(DESTINATIONS_FILE):
+            with open(DESTINATIONS_FILE, "r") as f:
+                data = json.load(f)
+                return {k: Destination(**v) for k, v in data.items()}
+    except Exception as e:
+        logger.warning(f"Failed to load destinations: {e}")
+    return {}
+
+
+def save_destinations(destinations) -> bool:
+    """Save destinations to persistent file."""
+    try:
+        os.makedirs(os.path.dirname(DESTINATIONS_FILE), exist_ok=True)
+        with open(DESTINATIONS_FILE, "w") as f:
+            json.dump({k: v.model_dump() for k, v in destinations.items()}, f, indent=2)
+        return True
+    except Exception as e:
+        logger.error(f"Failed to save destinations: {e}")
         return False

@@ -52,7 +52,7 @@ SPECTRA is an AI-powered security investigation assistant that provides SOC anal
 
 > **⚠️ IMPORTANT: Purple-MCP Dependency**
 >
-> SPECTRA requires a running instance of **[Purple-MCP](https://github.com/sentinelone/purple-mcp)** to function. Purple-MCP is the Model Context Protocol server that provides the tools for querying SentinelOne data.
+> SPECTRA requires a running instance of **[Purple-MCP](https://github.com/sentinel-one/purple-mcp)** to function. Purple-MCP is the Model Context Protocol server that provides the tools for querying SentinelOne data.
 >
 > **You must have Purple-MCP running before starting SPECTRA.**
 

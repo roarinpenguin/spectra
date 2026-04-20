@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect } from 'react'
+import { useState, useRef, useEffect, useMemo } from 'react'
 import {
   Send,
   Loader2,
@@ -30,8 +30,32 @@ import {
   Tag,
   Globe,
   ChevronUp,
+  Lock,
+  Upload,
+  ShieldOff,
+  ShieldCheck,
+  Paperclip,
+  FileText,
+  FileJson,
+  Image as ImageIcon,
+  Archive,
+  FileCode,
+  Package,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
+import * as storage from './storage'
+import * as evidenceStore from './evidenceStore'
+import { api, streamQuery } from './api'
+import { encryptVault, decryptVault, downloadVault, downloadPlain, pickJsonFile } from './crypto'
+import { exportCaseBundle } from './bundleExport'
+import { inspectBundle, importBundle } from './bundleImport'
+import {
+  ZoneProvider,
+  ZoneControlsBar,
+  useZoneSectionState,
+  classifyZone,
+  ZONES,
+} from './zoneControls.jsx'
 import remarkGfm from 'remark-gfm'
 import { jsPDF } from 'jspdf'
 import html2canvas from 'html2canvas'
@@ -575,8 +599,12 @@ function ChartableTable({ children, tableData, chartId }) {
   )
 }
 
-function CollapsibleSection({ title, children, defaultOpen = false }) {
-  const [isOpen, setIsOpen] = useState(defaultOpen)
+function CollapsibleSection({ title, children, defaultOpen = false, zone }) {
+  // Zone-aware: when wrapped in a ZoneProvider, the toolbar can flip this
+  // section open/closed via its zone. Local clicks still work and stay until
+  // the next preset is applied.
+  const resolvedZone = zone || classifyZone(title)
+  const [isOpen, setIsOpen] = useZoneSectionState(resolvedZone, { initialOpen: defaultOpen })
   return (
     <div className="border border-white/10 rounded-lg mb-2 overflow-hidden">
       <button
@@ -716,9 +744,11 @@ function MessageContent({ message }) {
           ) : null
         }
 
-        const isExpanded = expandByDefault.some(k => section.title.toLowerCase().includes(k)) || idx === 1
+        const zone = classifyZone(section.title)
+        const isExpanded =
+          expandByDefault.some(k => section.title.toLowerCase().includes(k)) || idx === 1
         return (
-          <CollapsibleSection key={idx} title={section.title} defaultOpen={isExpanded}>
+          <CollapsibleSection key={idx} title={section.title} defaultOpen={isExpanded} zone={zone}>
             <MarkdownSection content={section.content} messageId={`${message.id}-${idx}`} />
           </CollapsibleSection>
         )
@@ -732,7 +762,7 @@ function ThoughtProcess({ thoughtProcess }) {
   const { classification, reason, tool_calls } = thoughtProcess
 
   return (
-    <CollapsibleSection title="Thought Process" defaultOpen={false}>
+    <CollapsibleSection title="Thought Process" defaultOpen={false} zone={ZONES.THOUGHTS}>
       <div className="space-y-3">
         {/* Classification */}
         <div className="flex items-start gap-2">
@@ -745,11 +775,15 @@ function ThoughtProcess({ thoughtProcess }) {
           </div>
         </div>
 
-        {/* Tool call sequence */}
+        {/* Tool call sequence — gated by its own zone so the Zones bar can
+            hide just the tool list while keeping the reasoning visible. */}
         {tool_calls && tool_calls.length > 0 && (
-          <div>
-            <span className="text-xs font-semibold text-purple-300 uppercase tracking-wide ml-7">Tool Calls ({tool_calls.length})</span>
-            <div className="mt-1.5 ml-7 space-y-1">
+          <CollapsibleSection
+            title={`Tool Calls (${tool_calls.length})`}
+            defaultOpen={true}
+            zone={ZONES.TOOLS}
+          >
+            <div className="space-y-1">
               {tool_calls.map((call, idx) => (
                 <div key={idx} className="flex items-start gap-2">
                   <div className="flex items-center gap-1.5 min-w-0">
@@ -762,14 +796,61 @@ function ThoughtProcess({ thoughtProcess }) {
                 </div>
               ))}
             </div>
-          </div>
+          </CollapsibleSection>
         )}
       </div>
     </CollapsibleSection>
   )
 }
 
-function Message({ message, isUser }) {
+// Icon picker for an evidence, based on its MIME/name.
+function evidenceIcon(ev) {
+  const kind = evidenceStore.classifyEvidence(ev)
+  if (kind === 'image') return ImageIcon
+  if (kind === 'archive') return Archive
+  if (kind === 'binary') return Package
+  if (ev.mime === 'application/json' || /\.json$/i.test(ev.name || '')) return FileJson
+  if (kind === 'text') return FileCode
+  return FileText
+}
+
+function EvidenceChip({ evidence, onRemove, compact = false }) {
+  const Icon = evidenceIcon(evidence)
+  return (
+    <span
+      className={
+        'inline-flex items-center gap-1.5 rounded-full border border-white/15 bg-white/5 text-xs text-gray-200 ' +
+        (compact ? 'px-2 py-0.5' : 'px-2.5 py-1')
+      }
+      title={`${evidence.name} · ${evidence.mime || 'unknown'} · ${evidenceStore.formatBytes(evidence.size)}`}
+    >
+      <Icon className="w-3.5 h-3.5 text-purple-300" />
+      <span className="max-w-[180px] truncate">{evidence.name}</span>
+      <span className="text-[10px] text-gray-500">{evidenceStore.formatBytes(evidence.size)}</span>
+      {onRemove && (
+        <button
+          type="button"
+          onClick={(e) => { e.preventDefault(); e.stopPropagation(); onRemove(evidence) }}
+          className="ml-0.5 text-gray-500 hover:text-red-400"
+          title="Remove"
+        >
+          <X className="w-3 h-3" />
+        </button>
+      )}
+    </span>
+  )
+}
+
+function MessageEvidenceRow({ evidences }) {
+  if (!evidences || evidences.length === 0) return null
+  return (
+    <div className="mt-2 flex flex-wrap gap-1.5">
+      {evidences.map((ev) => <EvidenceChip key={ev.id} evidence={ev} compact />)}
+    </div>
+  )
+}
+
+function Message({ message, isUser, messageEvidences }) {
   return (
     <div className={`flex ${isUser ? 'justify-end' : 'justify-start'} animate-slide-up`}>
       <div
@@ -780,7 +861,10 @@ function Message({ message, isUser }) {
         }`}
       >
         {isUser ? (
-          <p className="whitespace-pre-wrap">{message.content}</p>
+          <>
+            <p className="whitespace-pre-wrap">{message.content}</p>
+            <MessageEvidenceRow evidences={messageEvidences} />
+          </>
         ) : (
           <>
             {message.agent && (
@@ -824,16 +908,87 @@ function Message({ message, isUser }) {
   )
 }
 
-function LoadingIndicator() {
+// Human-readable label for each SSE event the backend can emit.
+// Anything not listed falls back to the raw event name.
+const STEP_LABELS = {
+  connecting_mcp: 'Connecting to MCP server',
+  discovering_tools: 'Discovering available tools',
+  tools_discovered: 'Tools discovered',
+  classifying: 'Classifying your query',
+  routing: 'Routing to specialist agents',
+  orchestrator_start: 'Starting analysis',
+  agent_start: 'Agent investigating',
+  tool_call: 'Calling tool',
+  tool_result: 'Tool returned',
+  agent_complete: 'Agent finished',
+  synthesizing: 'Synthesizing findings',
+  thought_process: 'Preparing response',
+}
+
+function stepKey(ev) {
+  // Compound keys so simultaneous multi-agent work renders distinct rows
+  if (ev.event === 'agent_start' || ev.event === 'agent_complete') {
+    return `agent:${ev.data?.agent}`
+  }
+  if (ev.event === 'tool_call' || ev.event === 'tool_result') {
+    return `tool:${ev.data?.agent}:${ev.data?.tool}`
+  }
+  return ev.event
+}
+
+function ThinkingTimeline({ steps }) {
+  // Fallback when no events have arrived yet (still connecting, or non-streaming)
+  if (!steps || steps.length === 0) {
+    return (
+      <div className="flex justify-start animate-slide-up">
+        <div className="glass rounded-2xl px-5 py-4 flex items-center gap-3">
+          <Loader2 className="w-4 h-4 animate-spin text-purple-400" />
+          <span className="text-gray-400 text-sm">Connecting to SPECTRA…</span>
+        </div>
+      </div>
+    )
+  }
+
   return (
     <div className="flex justify-start animate-slide-up">
-      <div className="glass rounded-2xl px-5 py-4 flex items-center gap-2">
-        <div className="flex gap-1">
-          <div className="w-2 h-2 bg-purple-400 rounded-full loading-dot" />
-          <div className="w-2 h-2 bg-purple-400 rounded-full loading-dot" />
-          <div className="w-2 h-2 bg-purple-400 rounded-full loading-dot" />
+      <div className="glass rounded-2xl px-5 py-4 min-w-[320px] max-w-[640px]">
+        <div className="flex items-center gap-2 mb-3 pb-2 border-b border-white/5">
+          <div className="relative w-4 h-4">
+            <div className="absolute inset-0 rounded-full bg-purple-500/30 animate-ping" />
+            <div className="relative w-4 h-4 rounded-full bg-purple-500" />
+          </div>
+          <span className="text-sm font-medium text-purple-300">SPECTRA is thinking</span>
+          <span className="text-[10px] text-gray-500 ml-auto">{steps.length} step{steps.length !== 1 ? 's' : ''}</span>
         </div>
-        <span className="text-gray-400 text-sm ml-2">SPECTRA is correlating data...</span>
+        <ol className="space-y-1.5">
+          {steps.map((step, idx) => {
+            const isLast = idx === steps.length - 1
+            const isActive = !step.done && isLast
+            const isError = step.isError
+            return (
+              <li key={step.key + ':' + idx} className="flex items-start gap-2.5 text-sm animate-slide-up">
+                <span className="mt-0.5 flex-shrink-0 w-4 h-4">
+                  {isError ? (
+                    <X className="w-4 h-4 text-red-400" />
+                  ) : isActive ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-purple-400" />
+                  ) : (
+                    <Check className="w-4 h-4 text-green-400" />
+                  )}
+                </span>
+                <span className={`flex-1 ${isActive ? 'text-white' : isError ? 'text-red-300' : 'text-gray-400'}`}>
+                  {step.label}
+                  {step.detail && (
+                    <span className="ml-1.5 text-[11px] text-gray-500 font-mono">{step.detail}</span>
+                  )}
+                </span>
+                {step.ms != null && !isActive && (
+                  <span className="text-[10px] text-gray-600 tabular-nums mt-1">{step.ms}ms</span>
+                )}
+              </li>
+            )
+          })}
+        </ol>
       </div>
     </div>
   )
@@ -853,7 +1008,218 @@ function ExampleCard({ query, onClick }) {
   )
 }
 
-function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, destinations, onDestinationsChange }) {
+function VaultPanel({ onMessage, onChange }) {
+  const [passphrase, setPassphrase] = useState('')
+  const [confirmPassphrase, setConfirmPassphrase] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [sensitive, setSensitive] = useState(storage.isSensitiveMode())
+  const [showSessionId, setShowSessionId] = useState(false)
+  const sessionId = storage.getSessionId()
+
+  const handleEncryptedExport = async () => {
+    if (!passphrase || passphrase.length < 8) {
+      onMessage({ type: 'error', text: 'Passphrase must be at least 8 characters' })
+      return
+    }
+    if (passphrase !== confirmPassphrase) {
+      onMessage({ type: 'error', text: 'Passphrases do not match' })
+      return
+    }
+    setBusy(true)
+    try {
+      const snap = storage.exportSnapshot()
+      const env = await encryptVault(snap, passphrase)
+      downloadVault(env)
+      onMessage({ type: 'success', text: 'Encrypted vault downloaded' })
+      setPassphrase(''); setConfirmPassphrase('')
+    } catch (e) {
+      onMessage({ type: 'error', text: e.message })
+    } finally { setBusy(false) }
+  }
+
+  const handlePlainExport = () => {
+    if (!confirm('Export an UNENCRYPTED snapshot? Anyone who reads the file gets your API keys.')) return
+    try {
+      downloadPlain(storage.exportSnapshot())
+      onMessage({ type: 'success', text: 'Plain snapshot downloaded' })
+    } catch (e) {
+      onMessage({ type: 'error', text: e.message })
+    }
+  }
+
+  const handleImport = async () => {
+    setBusy(true)
+    try {
+      const file = await pickJsonFile()
+      let snapshot
+      if (file?.format === 'spectra-vault') {
+        const pwd = prompt('Enter the vault passphrase to decrypt:')
+        if (!pwd) { setBusy(false); return }
+        snapshot = await decryptVault(file, pwd)
+      } else if (file?.state) {
+        snapshot = file
+      } else {
+        throw new Error('File is neither a SPECTRA vault nor a plain snapshot')
+      }
+      const mode = confirm('OK = MERGE with current data\nCancel = REPLACE current data') ? 'merge' : 'replace'
+      storage.importSnapshot(snapshot, { mode })
+      onMessage({ type: 'success', text: `Imported (${mode})` })
+      onChange()
+    } catch (e) {
+      onMessage({ type: 'error', text: e.message })
+    } finally { setBusy(false) }
+  }
+
+  const handleSensitiveToggle = (next) => {
+    setSensitive(next)
+    storage.setSensitiveMode(next)
+    onMessage({ type: 'success', text: next
+      ? 'Sensitive mode ON — secrets will be cleared on browser reload'
+      : 'Sensitive mode OFF — secrets are persisted in localStorage' })
+  }
+
+  const handleClearAll = () => {
+    const phrase = prompt('Type DELETE to wipe ALL local data (consoles, library, settings).')
+    if (phrase !== 'DELETE') return
+    storage.clearAll()
+    onMessage({ type: 'success', text: 'All local data cleared. Reloading…' })
+    setTimeout(() => window.location.reload(), 800)
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* Encrypted export */}
+      <div className="glass rounded-xl p-4 border border-white/10 space-y-3">
+        <div className="flex items-center gap-2">
+          <Lock className="w-4 h-4 text-purple-400" />
+          <h3 className="text-sm font-medium text-purple-300">Encrypted Export (recommended)</h3>
+        </div>
+        <p className="text-xs text-gray-400">
+          Saves a passphrase-encrypted JSON file containing your consoles, API tokens, LLM settings,
+          and investigation library. Safe to email or store in any cloud drive. Uses AES-GCM-256 with
+          PBKDF2-SHA256 (600 000 iterations) via the browser's Web Crypto API.
+        </p>
+        <input
+          type="password"
+          placeholder="Passphrase (min. 8 characters)"
+          value={passphrase}
+          onChange={(e) => setPassphrase(e.target.value)}
+          className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+        />
+        <input
+          type="password"
+          placeholder="Confirm passphrase"
+          value={confirmPassphrase}
+          onChange={(e) => setConfirmPassphrase(e.target.value)}
+          className="w-full px-3 py-2 glass rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white placeholder-gray-500 text-sm"
+        />
+        <button
+          onClick={handleEncryptedExport}
+          disabled={busy}
+          className="w-full py-2 bg-purple-600 hover:bg-purple-500 text-white rounded-lg transition-smooth flex items-center justify-center gap-2 text-sm disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+          Download Encrypted Vault
+        </button>
+      </div>
+
+      {/* Import */}
+      <div className="glass rounded-xl p-4 border border-white/10 space-y-3">
+        <div className="flex items-center gap-2">
+          <Upload className="w-4 h-4 text-purple-400" />
+          <h3 className="text-sm font-medium text-purple-300">Import Vault or Snapshot</h3>
+        </div>
+        <p className="text-xs text-gray-400">
+          Upload a previously exported vault (you'll be prompted for the passphrase) or a plain snapshot.
+          You can choose to merge with the current data or replace it.
+        </p>
+        <button
+          onClick={handleImport}
+          disabled={busy}
+          className="w-full py-2 glass border border-purple-500/30 hover:bg-white/10 text-purple-300 rounded-lg transition-smooth flex items-center justify-center gap-2 text-sm disabled:opacity-50"
+        >
+          {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Upload className="w-4 h-4" />}
+          Choose file…
+        </button>
+      </div>
+
+      {/* Plain export (advanced) */}
+      <details className="glass rounded-xl p-4 border border-white/5">
+        <summary className="text-sm text-gray-400 cursor-pointer flex items-center gap-2">
+          <Download className="w-4 h-4" /> Plain (unencrypted) export — advanced
+        </summary>
+        <div className="mt-3 text-xs text-gray-500 space-y-2">
+          <p>For when you want to inspect or hand-edit the snapshot. Contains your secrets in cleartext.</p>
+          <button
+            onClick={handlePlainExport}
+            className="px-3 py-1.5 glass hover:bg-white/10 text-gray-300 rounded-lg text-xs flex items-center gap-2"
+          >
+            <Download className="w-3.5 h-3.5" /> Download plain snapshot
+          </button>
+        </div>
+      </details>
+
+      {/* Sensitive mode */}
+      <div className="glass rounded-xl p-4 border border-white/10 flex items-start gap-3">
+        {sensitive ? <ShieldCheck className="w-5 h-5 text-green-400 mt-0.5" /> : <ShieldOff className="w-5 h-5 text-gray-500 mt-0.5" />}
+        <div className="flex-1">
+          <div className="flex items-center justify-between gap-3">
+            <h3 className="text-sm font-medium text-white">Sensitive Mode</h3>
+            <button
+              onClick={() => handleSensitiveToggle(!sensitive)}
+              className={`relative w-11 h-6 rounded-full transition-smooth ${sensitive ? 'bg-purple-500' : 'bg-gray-600'}`}
+              aria-pressed={sensitive}
+            >
+              <span className={`absolute top-0.5 w-5 h-5 bg-white rounded-full transition-smooth ${sensitive ? 'left-5' : 'left-0.5'}`} />
+            </button>
+          </div>
+          <p className="text-xs text-gray-400 mt-1">
+            When ON, API keys and SentinelOne tokens are kept only in browser memory and are wiped on reload.
+            Useful on shared/kiosk machines. The rest (console URLs, names, library) still persists.
+          </p>
+        </div>
+      </div>
+
+      {/* Session id */}
+      <div className="glass rounded-xl p-4 border border-white/5">
+        <div className="flex items-center justify-between">
+          <h3 className="text-sm font-medium text-white">Browser Session ID</h3>
+          <button onClick={() => setShowSessionId((v) => !v)} className="text-xs text-purple-400 hover:text-purple-300">
+            {showSessionId ? 'Hide' : 'Show'}
+          </button>
+        </div>
+        <p className="text-[11px] text-gray-500 mt-1">
+          Sent on every API call as <code className="text-purple-400">X-Spectra-Session-Id</code> so the backend can
+          cache an MCP connection per browser. Not personally identifiable.
+        </p>
+        {showSessionId && (
+          <code className="block mt-2 p-2 bg-black/30 rounded text-xs text-gray-300 break-all">
+            {sessionId}
+          </code>
+        )}
+      </div>
+
+      {/* Danger zone */}
+      <div className="rounded-xl p-4 border border-red-500/30 bg-red-500/5 space-y-3">
+        <div className="flex items-center gap-2">
+          <AlertTriangle className="w-4 h-4 text-red-400" />
+          <h3 className="text-sm font-medium text-red-300">Danger Zone</h3>
+        </div>
+        <p className="text-xs text-gray-400">
+          Wipe ALL locally stored consoles, library, and settings from this browser. Cannot be undone.
+        </p>
+        <button
+          onClick={handleClearAll}
+          className="px-3 py-1.5 bg-red-600/40 hover:bg-red-600/60 text-red-200 rounded-lg text-xs flex items-center gap-2"
+        >
+          <Trash2 className="w-3.5 h-3.5" /> Clear all local data
+        </button>
+      </div>
+    </div>
+  )
+}
+
+function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, onRefreshModels, destinations, activeDestinationId, onDestinationsChange }) {
   const [activeTab, setActiveTab] = useState('consoles')
   const [formData, setFormData] = useState({
     llm_provider: settings?.llm_provider || 'anthropic',
@@ -861,6 +1227,8 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     llm_model: settings?.llm_model || '',
   })
   const [isSaving, setIsSaving] = useState(false)
+  const [isRefreshingModels, setIsRefreshingModels] = useState(false)
+  const [modelsRefreshedAt, setModelsRefreshedAt] = useState(null)
   const [message, setMessage] = useState(null)
   const [showLogs, setShowLogs] = useState(false)
 
@@ -894,39 +1262,59 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     }))
   }
 
-  const handleSaveLLM = async () => {
+  const handleSaveLLM = () => {
     setIsSaving(true)
     setMessage(null)
     try {
-      const payload = {}
-      if (formData.llm_provider !== settings?.llm_provider) {
-        payload.llm_provider = formData.llm_provider
+      const patch = {
+        provider: formData.llm_provider,
+        model: formData.llm_model,
       }
-      if (formData.llm_api_key) {
-        payload.llm_api_key = formData.llm_api_key
-      }
-      if (formData.llm_model !== settings?.llm_model) {
-        payload.llm_model = formData.llm_model
-      }
-
-      const response = await fetch('/api/settings', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+      // Empty key = keep existing
+      if (formData.llm_api_key) patch.apiKey = formData.llm_api_key
+      const next = storage.setLLM(patch)
+      setMessage({ type: 'success', text: 'LLM settings saved' })
+      onSave({
+        llm_provider: next.provider,
+        llm_model: next.model,
+        llm_api_key_set: !!next.apiKey,
+        llm_api_key_preview: next.apiKey ? next.apiKey.slice(0, 8) + '…' : '',
       })
-      const data = await response.json()
-      
-      if (data.status === 'success') {
-        setMessage({ type: 'success', text: data.message || 'Settings saved!' })
-        onSave(data.settings)
-        setFormData(prev => ({ ...prev, llm_api_key: '' }))
-      } else {
-        setMessage({ type: 'error', text: data.detail || 'Failed to save settings' })
-      }
+      setFormData((prev) => ({ ...prev, llm_api_key: '' }))
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     } finally {
       setIsSaving(false)
+    }
+  }
+
+  const handleRefreshModels = async () => {
+    // Prefer the freshly typed key; fall back to the stored one so users
+    // who've already saved a key can refresh without re-entering it.
+    const key = formData.llm_api_key || storage.getLLM().apiKey
+    if (!key) {
+      setMessage({ type: 'error', text: 'Enter an API key first, then refresh' })
+      return
+    }
+    setIsRefreshingModels(true)
+    setMessage(null)
+    try {
+      const res = await api.refreshModels(formData.llm_provider, key)
+      if (res?.status === 'success' && Array.isArray(res.models)) {
+        onRefreshModels(formData.llm_provider, res.models)
+        setModelsRefreshedAt(new Date())
+        setMessage({ type: 'success', text: `Found ${res.models.length} models for ${formData.llm_provider}` })
+        // Auto-select the first returned model if none is set or the current one isn't available
+        if (!res.models.includes(formData.llm_model)) {
+          setFormData((prev) => ({ ...prev, llm_model: res.models[0] || '' }))
+        }
+      } else {
+        setMessage({ type: 'error', text: 'Unexpected response from provider' })
+      }
+    } catch (e) {
+      setMessage({ type: 'error', text: e.message || 'Failed to refresh models' })
+    } finally {
+      setIsRefreshingModels(false)
     }
   }
 
@@ -936,7 +1324,7 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     setShowDestForm(false)
   }
 
-  const handleSaveDest = async () => {
+  const handleSaveDest = () => {
     if (!destForm.name.trim() || !destForm.console_url.trim() || !destForm.mcp_server_url.trim()) {
       setMessage({ type: 'error', text: 'Name, Console URL, and MCP Server URL are required' })
       return
@@ -944,28 +1332,25 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     setIsSaving(true)
     setMessage(null)
     try {
-      let response
       if (editingDest) {
-        response = await fetch(`/api/destinations/${editingDest}`, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(destForm),
+        storage.updateDestination(editingDest, {
+          name: destForm.name,
+          consoleUrl: destForm.console_url,
+          mcpServerUrl: destForm.mcp_server_url,
+          apiToken: destForm.api_token, // empty = keep current
         })
+        setMessage({ type: 'success', text: 'Console updated' })
       } else {
-        response = await fetch('/api/destinations', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(destForm),
+        storage.addDestination({
+          name: destForm.name,
+          consoleUrl: destForm.console_url,
+          apiToken: destForm.api_token,
+          mcpServerUrl: destForm.mcp_server_url,
         })
+        setMessage({ type: 'success', text: 'Console added' })
       }
-      const data = await response.json()
-      if (data.status === 'success') {
-        setMessage({ type: 'success', text: data.message })
-        resetDestForm()
-        onDestinationsChange()
-      } else {
-        setMessage({ type: 'error', text: data.detail || 'Failed to save' })
-      }
+      resetDestForm()
+      onDestinationsChange()
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     } finally {
@@ -973,15 +1358,12 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     }
   }
 
-  const handleDeleteDest = async (id, name) => {
+  const handleDeleteDest = (id, name) => {
     if (!confirm(`Delete console "${name}"?`)) return
     try {
-      const response = await fetch(`/api/destinations/${id}`, { method: 'DELETE' })
-      const data = await response.json()
-      if (data.status === 'success') {
-        setMessage({ type: 'success', text: 'Console deleted' })
-        onDestinationsChange()
-      }
+      storage.deleteDestination(id)
+      setMessage({ type: 'success', text: 'Console deleted' })
+      onDestinationsChange()
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     }
@@ -991,9 +1373,9 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
     setEditingDest(dest.id)
     setDestForm({
       name: dest.name,
-      console_url: dest.console_url,
+      console_url: dest.consoleUrl,
       api_token: '',
-      mcp_server_url: dest.mcp_server_url,
+      mcp_server_url: dest.mcpServerUrl,
     })
     setShowDestForm(true)
   }
@@ -1033,6 +1415,15 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
           >
             <Sparkles className="w-4 h-4" />
             LLM Configuration
+          </button>
+          <button
+            onClick={() => setActiveTab('vault')}
+            className={`px-4 py-2 rounded-lg text-sm font-medium transition-smooth flex items-center gap-2 ${
+              activeTab === 'vault' ? 'bg-purple-600/30 text-white border border-purple-500/50' : 'text-gray-400 hover:text-white hover:bg-white/5'
+            }`}
+          >
+            <Lock className="w-4 h-4" />
+            Vault &amp; Privacy
           </button>
         </div>
 
@@ -1077,7 +1468,7 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
                   <div>
                     <label className="block text-xs text-gray-400 mb-1">
                       API Token
-                      {editingDest && destinations.find(d => d.id === editingDest)?.api_token_set && (
+                      {editingDest && !!destinations.find(d => d.id === editingDest)?.apiToken && (
                         <span className="text-green-400 ml-2">✓ Set</span>
                       )}
                     </label>
@@ -1127,18 +1518,20 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
                 </div>
               ) : (
                 <div className="space-y-2">
-                  {destinations.map((dest) => (
+                  {destinations.map((dest) => {
+                    const isActive = dest.id === activeDestinationId
+                    return (
                     <div
                       key={dest.id}
                       className={`glass p-4 rounded-xl transition-smooth group ${
-                        dest.is_active ? 'border border-purple-500/40 bg-purple-500/5' : 'hover:bg-white/5'
+                        isActive ? 'border border-purple-500/40 bg-purple-500/5' : 'hover:bg-white/5'
                       }`}
                     >
                       <div className="flex items-start justify-between">
                         <div className="flex-1 min-w-0">
                           <div className="flex items-center gap-2">
                             <h4 className="font-medium text-white truncate">{dest.name}</h4>
-                            {dest.is_active && (
+                            {isActive && (
                               <span className="px-2 py-0.5 text-[10px] font-semibold bg-purple-500/20 text-purple-300 rounded-full border border-purple-500/30 uppercase tracking-wide">
                                 Active
                               </span>
@@ -1146,22 +1539,22 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
                           </div>
                           <p className="text-xs text-gray-400 mt-1 truncate flex items-center gap-1">
                             <Globe className="w-3 h-3 flex-shrink-0" />
-                            {dest.console_url}
+                            {dest.consoleUrl}
                           </p>
                           <p className="text-xs text-gray-500 mt-0.5 truncate flex items-center gap-1">
                             <Server className="w-3 h-3 flex-shrink-0" />
-                            {dest.mcp_server_url}
+                            {dest.mcpServerUrl}
                           </p>
                           <div className="flex items-center gap-3 mt-1.5 text-[11px] text-gray-600">
-                            {dest.api_token_set && (
+                            {!!dest.apiToken && (
                               <span className="flex items-center gap-1 text-green-500">
                                 <Key className="w-3 h-3" /> Token set
                               </span>
                             )}
-                            {dest.last_used && (
+                            {dest.lastUsed && (
                               <span className="flex items-center gap-1">
                                 <Clock className="w-3 h-3" />
-                                Last used: {new Date(dest.last_used).toLocaleDateString()}
+                                Last used: {new Date(dest.lastUsed).toLocaleDateString()}
                               </span>
                             )}
                           </div>
@@ -1184,7 +1577,7 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
                         </div>
                       </div>
                     </div>
-                  ))}
+                  )})}
                 </div>
               )}
             </div>
@@ -1239,9 +1632,30 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
 
               {/* LLM Model */}
               <div>
-                <label className="block text-sm font-medium text-gray-300 mb-2">
-                  Model
-                </label>
+                <div className="flex items-center justify-between mb-2">
+                  <label className="block text-sm font-medium text-gray-300">
+                    Model
+                    {modelsRefreshedAt && (
+                      <span className="ml-2 text-[10px] font-normal text-green-400">
+                        · live list ({modelsRefreshedAt.toLocaleTimeString()})
+                      </span>
+                    )}
+                  </label>
+                  <button
+                    type="button"
+                    onClick={handleRefreshModels}
+                    disabled={isRefreshingModels}
+                    title="Fetch the list of models actually available to this API key"
+                    className="flex items-center gap-1.5 px-2.5 py-1 text-xs text-purple-300 hover:text-purple-200 hover:bg-white/5 rounded-lg transition-smooth disabled:opacity-50 disabled:cursor-not-allowed"
+                  >
+                    {isRefreshingModels ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <RefreshCw className="w-3.5 h-3.5" />
+                    )}
+                    {isRefreshingModels ? 'Checking…' : 'Refresh from API key'}
+                  </button>
+                </div>
                 <select
                   value={formData.llm_model}
                   onChange={(e) => setFormData(prev => ({ ...prev, llm_model: e.target.value }))}
@@ -1277,6 +1691,14 @@ function SettingsModal({ isOpen, onClose, settings, onSave, availableModels, des
                 )}
               </button>
             </div>
+          )}
+
+          {/* === Vault & Privacy Tab === */}
+          {activeTab === 'vault' && (
+            <VaultPanel
+              onMessage={setMessage}
+              onChange={() => { onDestinationsChange(); }}
+            />
           )}
         </div>
 
@@ -1316,8 +1738,7 @@ function LogsModal({ isOpen, onClose }) {
   const fetchLogs = async () => {
     setIsLoading(true)
     try {
-      const res = await fetch('/api/logs?container=all&lines=200')
-      const data = await res.json()
+      const data = await api.logs(200)
       if (data.status === 'success') {
         setLogs(data.logs)
       }
@@ -1455,7 +1876,7 @@ function LogsModal({ isOpen, onClose }) {
 }
 
 // Investigation Library Modal
-function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages }) {
+function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages, conversationKey, currentEvidenceIds }) {
   const [investigations, setInvestigations] = useState([])
   const [isLoading, setIsLoading] = useState(false)
   const [showSaveForm, setShowSaveForm] = useState(false)
@@ -1464,6 +1885,12 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
   const [saveTags, setSaveTags] = useState('')
   const [editingId, setEditingId] = useState(null)
   const [message, setMessage] = useState(null)
+  // --- Import bundle state ---
+  const [importBusy, setImportBusy] = useState(false)
+  const [importProgress, setImportProgress] = useState('')
+  const [importInspection, setImportInspection] = useState(null)
+  const [importConflict, setImportConflict] = useState(null) // { resolve: (decision) => void, existing, incoming }
+  const importFileInputRef = useRef(null)
 
   useEffect(() => {
     if (isOpen) {
@@ -1471,19 +1898,12 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
     }
   }, [isOpen])
 
-  const loadInvestigations = async () => {
-    setIsLoading(true)
-    try {
-      const response = await fetch('/api/investigations')
-      const data = await response.json()
-      if (data.status === 'success') {
-        setInvestigations(data.investigations)
-      }
-    } catch (error) {
-      console.error('Failed to load investigations:', error)
-    } finally {
-      setIsLoading(false)
-    }
+  const loadInvestigations = () => {
+    // Browser-owned: read directly from localStorage, sorted newest-first
+    const all = [...storage.getInvestigations()].sort((a, b) =>
+      String(b.updated_at || '').localeCompare(String(a.updated_at || ''))
+    )
+    setInvestigations(all)
   }
 
   const handleSave = async () => {
@@ -1498,29 +1918,25 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
 
     setIsLoading(true)
     try {
-      const response = await fetch('/api/investigations', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          title: saveTitle,
-          description: saveDescription,
-          messages: currentMessages,
-          tags: saveTags.split(',').map(t => t.trim()).filter(t => t),
-          investigation_id: editingId,
-        }),
+      // Use the live conversationKey as the id for new saves so evidences in
+      // IndexedDB (which were stored against conversationKey) remain linked
+      // to the newly-created investigation without a migration step.
+      const saveId = editingId || conversationKey
+      storage.saveInvestigation({
+        id: saveId,
+        title: saveTitle,
+        description: saveDescription,
+        messages: currentMessages,
+        tags: saveTags.split(',').map(t => t.trim()).filter(t => t),
+        evidenceIds: Array.isArray(currentEvidenceIds) ? currentEvidenceIds : [],
       })
-      const data = await response.json()
-      if (data.status === 'success') {
-        setMessage({ type: 'success', text: data.message })
-        setShowSaveForm(false)
-        setSaveTitle('')
-        setSaveDescription('')
-        setSaveTags('')
-        setEditingId(null)
-        loadInvestigations()
-      } else {
-        setMessage({ type: 'error', text: data.detail || 'Failed to save' })
-      }
+      setMessage({ type: 'success', text: editingId ? 'Investigation updated' : 'Investigation saved' })
+      setShowSaveForm(false)
+      setSaveTitle('')
+      setSaveDescription('')
+      setSaveTags('')
+      setEditingId(null)
+      loadInvestigations()
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     } finally {
@@ -1528,16 +1944,12 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
     }
   }
 
-  const handleDelete = async (id, title) => {
+  const handleDelete = (id, title) => {
     if (!confirm(`Delete investigation "${title}"?`)) return
-    
     try {
-      const response = await fetch(`/api/investigations/${id}`, { method: 'DELETE' })
-      const data = await response.json()
-      if (data.status === 'success') {
-        setMessage({ type: 'success', text: 'Investigation deleted' })
-        loadInvestigations()
-      }
+      storage.deleteInvestigation(id)
+      setMessage({ type: 'success', text: 'Investigation deleted' })
+      loadInvestigations()
     } catch (error) {
       setMessage({ type: 'error', text: error.message })
     }
@@ -1546,6 +1958,90 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
   const handleLoad = (investigation) => {
     onLoadInvestigation(investigation)
     onClose()
+  }
+
+  // ------------------------- Import bundle -------------------------
+  const handleImportFileSelected = async (file) => {
+    if (!file) return
+    setImportBusy(true)
+    setImportProgress('Reading ZIP…')
+    setMessage(null)
+    try {
+      const inspection = await inspectBundle(file)
+      if (!inspection.messages) {
+        setMessage({
+          type: 'error',
+          text: 'This bundle has neither messages.json nor a parseable conversation.md. Nothing to import.',
+        })
+        setImportBusy(false)
+        setImportProgress('')
+        return
+      }
+      const degraded = inspection.messagesSource !== 'messages.json'
+      setImportInspection(inspection)
+      // If an investigation already exists with this id, ask the user.
+      let conflictDecision = null
+      const runImport = async (decisionForInvestigation) => {
+        try {
+          const result = await importBundle({
+            inspection,
+            titleOverride: null,
+            onConflict: async ({ kind, existing, incoming }) => {
+              if (kind === 'investigation') return decisionForInvestigation
+              // Evidence-level: always dedupe by sha256 (silent 'skip'). Users
+              // rarely want duplicate evidence bytes in the same case.
+              return 'skip'
+            },
+            onProgress: (m) => setImportProgress(m),
+          })
+          setMessage({
+            type: 'success',
+            text:
+              `Imported "${inspection.manifest?.title || 'case'}" — ` +
+              `${inspection.messages.length} messages, ` +
+              `${result.addedEvidences.length} new evidences, ` +
+              `${result.skippedEvidences.length} skipped.` +
+              (degraded
+                ? ' (Degraded import: messages reconstructed from conversation.md; thought process, tool calls and evidence links were not recovered.)'
+                : ''),
+          })
+          loadInvestigations()
+        } catch (e) {
+          setMessage({ type: 'error', text: e.message || String(e) })
+        } finally {
+          setImportBusy(false)
+          setImportProgress('')
+          setImportInspection(null)
+          setImportConflict(null)
+        }
+      }
+
+      if (inspection.existing) {
+        // Defer until user picks a resolution via the conflict dialog.
+        setImportConflict({
+          existing: inspection.existing,
+          incoming: { id: inspection.incomingId, title: inspection.manifest?.title || '(untitled)' },
+          resolve: (decision) => {
+            if (decision === 'cancel') {
+              setImportBusy(false)
+              setImportProgress('')
+              setImportInspection(null)
+              setImportConflict(null)
+              setMessage({ type: 'error', text: 'Import cancelled.' })
+              return
+            }
+            setImportConflict(null)
+            runImport(decision)
+          },
+        })
+      } else {
+        await runImport('rename') // decision irrelevant when no conflict
+      }
+    } catch (e) {
+      setMessage({ type: 'error', text: `Import failed: ${e.message || e}` })
+      setImportBusy(false)
+      setImportProgress('')
+    }
   }
 
   const formatDate = (isoString) => {
@@ -1581,14 +2077,46 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
         {/* Save current chat section */}
         <div className="mb-4 p-4 glass rounded-xl">
           {!showSaveForm ? (
-            <button
-              onClick={() => setShowSaveForm(true)}
-              className="flex items-center gap-2 text-purple-400 hover:text-purple-300 transition-smooth"
-              disabled={currentMessages.length === 0}
-            >
-              <Save className="w-4 h-4" />
-              <span>Save current investigation ({currentMessages.length} messages)</span>
-            </button>
+            <div className="flex items-center justify-between gap-3 flex-wrap">
+              <button
+                onClick={() => setShowSaveForm(true)}
+                className="flex items-center gap-2 text-purple-400 hover:text-purple-300 transition-smooth"
+                disabled={currentMessages.length === 0}
+              >
+                <Save className="w-4 h-4" />
+                <span>Save current investigation ({currentMessages.length} messages)</span>
+              </button>
+
+              <div className="flex items-center gap-2">
+                <input
+                  ref={importFileInputRef}
+                  type="file"
+                  accept=".zip,application/zip"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    e.target.value = ''
+                    if (f) handleImportFileSelected(f)
+                  }}
+                />
+                <button
+                  onClick={() => importFileInputRef.current?.click()}
+                  disabled={importBusy}
+                  className="flex items-center gap-2 px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 text-sm text-gray-200 transition-smooth disabled:opacity-50"
+                  title="Import a SPECTRA Case Bundle (.zip) exported by another browser"
+                >
+                  {importBusy ? (
+                    <Loader2 className="w-4 h-4 animate-spin text-purple-400" />
+                  ) : (
+                    <Upload className="w-4 h-4 text-purple-400" />
+                  )}
+                  <span>Import bundle</span>
+                </button>
+                {importBusy && importProgress && (
+                  <span className="text-xs text-purple-300">{importProgress}</span>
+                )}
+              </div>
+            </div>
           ) : (
             <div className="space-y-3">
               <input
@@ -1705,6 +2233,214 @@ function LibraryModal({ isOpen, onClose, onLoadInvestigation, currentMessages })
             </div>
           )}
         </div>
+
+        {/* Import conflict dialog — shown when an investigation with the
+            same id already exists in the library. */}
+        {importConflict && (
+          <div className="absolute inset-0 z-10 flex items-center justify-center p-4 bg-black/70 backdrop-blur-sm">
+            <div className="glass-darker rounded-2xl border border-white/10 shadow-2xl w-full max-w-md p-5 animate-slide-up">
+              <div className="flex items-center gap-2 mb-3">
+                <AlertTriangle className="w-5 h-5 text-amber-400" />
+                <h3 className="text-lg font-semibold text-gray-100">Investigation already exists</h3>
+              </div>
+              <p className="text-sm text-gray-400 mb-4">
+                An investigation titled{' '}
+                <span className="text-gray-200 font-medium">"{importConflict.existing.title}"</span>{' '}
+                already exists with id{' '}
+                <code className="text-[11px] text-gray-400">{importConflict.existing.id}</code>.
+                How would you like to handle this?
+              </p>
+              <div className="space-y-2">
+                <button
+                  onClick={() => importConflict.resolve('rename')}
+                  className="w-full text-left px-3 py-2.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 transition-smooth"
+                >
+                  <div className="text-sm text-gray-100 font-medium">Keep both (rename incoming)</div>
+                  <div className="text-xs text-gray-500">Imports as a new investigation with a fresh id. Evidences are re-added under the new id.</div>
+                </button>
+                <button
+                  onClick={() => importConflict.resolve('replace')}
+                  className="w-full text-left px-3 py-2.5 rounded-lg bg-red-500/10 border border-red-500/30 hover:bg-red-500/20 transition-smooth"
+                >
+                  <div className="text-sm text-red-200 font-medium">Replace existing</div>
+                  <div className="text-xs text-red-300/80">Overwrites the existing investigation with the bundle's contents. Existing evidences for that id are kept (sha256-deduped).</div>
+                </button>
+                <button
+                  onClick={() => importConflict.resolve('cancel')}
+                  className="w-full text-left px-3 py-2.5 rounded-lg bg-white/5 border border-white/10 hover:bg-white/10 transition-smooth"
+                >
+                  <div className="text-sm text-gray-100 font-medium">Cancel</div>
+                  <div className="text-xs text-gray-500">Abort the import.</div>
+                </button>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  )
+}
+
+// ---------------------------------------------------------------------------
+// Export Case Bundle modal
+// ---------------------------------------------------------------------------
+function ExportBundleModal({
+  isOpen,
+  onClose,
+  title,
+  conversationId,
+  messages,
+  meta,
+  buildPdfBlob,
+}) {
+  const [opts, setOpts] = useState({
+    includeMarkdown: true, // locked on
+    includePdf: false,
+    includeArtefacts: true,
+    includeEvidences: true,
+    redact: false,
+  })
+  const [evidenceCount, setEvidenceCount] = useState(0)
+  const [evidenceSize, setEvidenceSize] = useState(0)
+  const [busy, setBusy] = useState(false)
+  const [progress, setProgress] = useState('')
+  const [caseTitle, setCaseTitle] = useState(title || 'SPECTRA Investigation')
+
+  useEffect(() => { setCaseTitle(title || 'SPECTRA Investigation') }, [title])
+
+  useEffect(() => {
+    let cancelled = false
+    if (!isOpen || !conversationId) return
+    ;(async () => {
+      const list = await evidenceStore.listEvidences(conversationId)
+      if (cancelled) return
+      setEvidenceCount(list.length)
+      setEvidenceSize(list.reduce((a, e) => a + (e.size || 0), 0))
+    })()
+    return () => { cancelled = true }
+  }, [isOpen, conversationId])
+
+  const toggle = (k) => setOpts((p) => ({ ...p, [k]: !p[k] }))
+
+  const handleExport = async () => {
+    setBusy(true); setProgress('Starting…')
+    try {
+      let pdfBlob = null
+      if (opts.includePdf && typeof buildPdfBlob === 'function') {
+        setProgress('Rendering PDF…')
+        pdfBlob = await buildPdfBlob()
+      }
+      await exportCaseBundle({
+        title: caseTitle,
+        messages,
+        conversationId,
+        meta,
+        options: {
+          includePdf: opts.includePdf,
+          includeArtefacts: opts.includeArtefacts,
+          includeEvidences: opts.includeEvidences,
+          redact: opts.redact,
+        },
+        pdfBlob,
+        onProgress: (m) => setProgress(m),
+      })
+      setProgress('Done.')
+      setTimeout(() => { setBusy(false); onClose() }, 500)
+    } catch (e) {
+      console.error(e)
+      setProgress(`Failed: ${e.message || e}`)
+      setBusy(false)
+    }
+  }
+
+  if (!isOpen) return null
+
+  const Row = ({ k, label, desc, locked, disabled }) => (
+    <label className={`flex items-start gap-3 p-3 rounded-lg border transition-smooth ${
+      opts[k]
+        ? 'border-purple-500/30 bg-purple-500/5'
+        : 'border-white/10 bg-white/5'
+    } ${disabled ? 'opacity-50 cursor-not-allowed' : 'cursor-pointer hover:bg-white/10'}`}>
+      <input
+        type="checkbox"
+        className="mt-1 accent-purple-500"
+        checked={!!opts[k]}
+        disabled={locked || disabled}
+        onChange={() => !locked && !disabled && toggle(k)}
+      />
+      <div className="flex-1">
+        <div className="text-sm text-gray-200 font-medium flex items-center gap-2">
+          {label}
+          {locked && <span className="text-[10px] text-purple-300 px-1.5 py-0.5 rounded bg-purple-500/15 border border-purple-500/25">always on</span>}
+        </div>
+        {desc && <p className="text-xs text-gray-500 mt-0.5">{desc}</p>}
+      </div>
+    </label>
+  )
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/60 backdrop-blur-sm">
+      <div className="glass-darker rounded-2xl border border-white/10 shadow-2xl w-full max-w-xl animate-slide-up overflow-hidden">
+        <div className="px-5 py-4 border-b border-white/5 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <Package className="w-5 h-5 text-purple-400" />
+            <h3 className="text-lg font-semibold text-gray-100">Export Case Bundle</h3>
+          </div>
+          <button onClick={onClose} className="p-1.5 rounded-lg hover:bg-white/10 text-gray-400" disabled={busy}>
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="p-5 space-y-4">
+          <div>
+            <label className="text-xs text-gray-500 uppercase tracking-wider">Case title</label>
+            <input
+              type="text"
+              value={caseTitle}
+              onChange={(e) => setCaseTitle(e.target.value)}
+              className="mt-1 w-full px-3 py-2 rounded-lg bg-white/5 border border-white/10 focus:border-purple-500 focus:outline-none text-white text-sm"
+              placeholder="Case title"
+            />
+          </div>
+
+          <div className="space-y-2">
+            <Row k="includeMarkdown" label="Conversation (Markdown)" desc="conversation.md — always included as a reliable fallback." locked />
+            <Row k="includePdf" label="Conversation (PDF)" desc="conversation.pdf — same renderer as the toolbar PDF export." />
+            <Row k="includeArtefacts" label="Agent artefacts (JSON)" desc="One artefacts/*.json per assistant message (thought process, tools, timings)." />
+            <Row
+              k="includeEvidences"
+              label={`Uploaded evidences (${evidenceCount})`}
+              desc={`evidences/ folder with originals + .meta.json sidecars. ${evidenceStore.formatBytes(evidenceSize)} total.`}
+              disabled={evidenceCount === 0}
+            />
+            <Row k="redact" label="Redact secrets" desc="Best-effort scrubbing of bearer tokens, API keys, long secret-shaped strings." />
+          </div>
+
+          {busy && (
+            <div className="flex items-center gap-2 text-xs text-purple-300">
+              <Loader2 className="w-3.5 h-3.5 animate-spin" />
+              <span>{progress}</span>
+            </div>
+          )}
+        </div>
+
+        <div className="px-5 py-4 border-t border-white/5 flex items-center justify-end gap-2">
+          <button
+            onClick={onClose}
+            disabled={busy}
+            className="px-4 py-2 rounded-lg text-sm text-gray-300 hover:bg-white/5 transition-smooth"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={handleExport}
+            disabled={busy || messages.length === 0}
+            className="px-4 py-2 rounded-lg bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 text-white text-sm font-medium flex items-center gap-2 disabled:opacity-50"
+          >
+            {busy ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            Download ZIP
+          </button>
+        </div>
       </div>
     </div>
   )
@@ -1714,6 +2450,8 @@ function App() {
   const [messages, setMessages] = useState([])
   const [input, setInput] = useState('')
   const [isLoading, setIsLoading] = useState(false)
+  // Live progress steps fed by the SSE /api/query stream
+  const [thinkingSteps, setThinkingSteps] = useState([])
   // selectedCategory removed - ARIA handles all categories intelligently
   const [mcpStatus, setMcpStatus] = useState({ status: 'checking', mcp_server: '' })
   const [isCheckingStatus, setIsCheckingStatus] = useState(false)
@@ -1729,64 +2467,174 @@ function App() {
   const consoleSelectorRef = useRef(null)
   const messagesEndRef = useRef(null)
 
-  // Load settings, destinations, and check MCP server connection on load
+  // --- Evidence state ---------------------------------------------------
+  // Conversation key: bound to either an existing investigation id (loaded
+  // from the library) or a freshly-minted id for a new draft. Evidences are
+  // stored in IndexedDB against this key, so saving the investigation later
+  // with the same id keeps them linked for free.
+  const [conversationKey, setConversationKey] = useState(() => {
+    if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID().slice(0, 12)
+    return 'conv-' + Math.random().toString(36).slice(2, 14)
+  })
+  // Evidences still "pending" — attached to the composer but not yet committed
+  // to a user message. On send they become the next message's evidenceIds.
+  const [pendingEvidences, setPendingEvidences] = useState([])
+  // All evidences for the current conversation — used to resolve chips on
+  // historical messages.
+  const [conversationEvidences, setConversationEvidences] = useState([])
+  // Composer drag-and-drop highlight
+  const [isDraggingOver, setIsDraggingOver] = useState(false)
+  // Export bundle modal
+  const [showExportBundle, setShowExportBundle] = useState(false)
+  const fileInputRef = useRef(null)
+
+  // Reload conversation evidences whenever the key changes or storage bumps.
+  const reloadEvidences = async () => {
+    try {
+      const list = await evidenceStore.listEvidences(conversationKey)
+      setConversationEvidences(list)
+    } catch (e) {
+      console.error('[evidence] list failed:', e)
+    }
+  }
+  useEffect(() => { reloadEvidences() }, [conversationKey])
   useEffect(() => {
-    loadSettings()
-    loadDestinations()
-    checkMcpHealth()
+    const unsub = evidenceStore.subscribe(() => { reloadEvidences() })
+    return () => { unsub && unsub() }
+  }, [conversationKey])
+
+  const handleAttachFiles = async (fileList) => {
+    const files = Array.from(fileList || []).filter(Boolean)
+    if (files.length === 0) return
+    const added = []
+    for (const f of files) {
+      try {
+        const meta = await evidenceStore.addEvidence({ conversationId: conversationKey, file: f })
+        added.push(meta)
+      } catch (e) {
+        console.error('[evidence] add failed:', e)
+      }
+    }
+    if (added.length) setPendingEvidences((p) => [...p, ...added])
+  }
+
+  const handleRemovePendingEvidence = async (ev) => {
+    try { await evidenceStore.deleteEvidence(ev.id) } catch {}
+    setPendingEvidences((p) => p.filter((x) => x.id !== ev.id))
+  }
+
+  const handleComposerDrop = async (e) => {
+    e.preventDefault(); e.stopPropagation()
+    setIsDraggingOver(false)
+    const dt = e.dataTransfer
+    if (!dt) return
+    if (dt.files && dt.files.length) await handleAttachFiles(dt.files)
+  }
+
+  const handleComposerPaste = async (e) => {
+    const items = e.clipboardData?.items
+    if (!items) return
+    const files = []
+    for (const it of items) {
+      if (it.kind === 'file') {
+        const f = it.getAsFile()
+        if (f) files.push(f)
+      }
+    }
+    if (files.length) {
+      e.preventDefault()
+      await handleAttachFiles(files)
+    }
+  }
+
+  // Start a completely new conversation (clears messages, mints a new key).
+  const startNewConversation = () => {
+    setMessages([])
+    setCurrentInvestigationId(null)
+    setPendingEvidences([])
+    const k = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID().slice(0, 12)
+      : 'conv-' + Math.random().toString(36).slice(2, 14)
+    setConversationKey(k)
+  }
+
+  // Bootstrap: hydrate from localStorage, optionally migrate legacy server data,
+  // then fetch the static model catalog and probe MCP health.
+  useEffect(() => {
+    bootstrap()
   }, [])
 
-  const loadSettings = async () => {
+  const reloadFromStorage = () => {
+    setDestinations(storage.getDestinations())
+    setActiveDestination(storage.getActiveDestination())
+    const llm = storage.getLLM()
+    setSettings({
+      llm_provider: llm.provider,
+      llm_model: llm.model,
+      llm_api_key_set: !!llm.apiKey,
+      llm_api_key_preview: llm.apiKey ? llm.apiKey.slice(0, 8) + '…' : '',
+    })
+  }
+
+  const bootstrap = async () => {
+    // 1. One-shot migration from v1.0 single-tenant config files (if any).
+    if (storage.getDestinations().length === 0 && storage.getInvestigations().length === 0) {
+      try {
+        const res = await fetch('/api/legacy/bootstrap')
+        const data = await res.json()
+        const blob = data?.data || {}
+        if (blob.destinations?.length) {
+          for (const d of blob.destinations) {
+            storage.addDestination({
+              name: d.name,
+              consoleUrl: d.console_url || d.consoleUrl || '',
+              apiToken: d.api_token || d.apiToken || '',
+              mcpServerUrl: d.mcp_server_url || d.mcpServerUrl || '',
+            })
+          }
+        }
+        if (blob.investigations?.length) {
+          for (const inv of blob.investigations) {
+            storage.saveInvestigation({
+              title: inv.title,
+              description: inv.description,
+              messages: inv.messages,
+              tags: inv.tags || [],
+            })
+          }
+        }
+        if (blob.llm) {
+          storage.setLLM({ provider: blob.llm.provider, model: blob.llm.model, apiKey: blob.llm.api_key })
+        }
+      } catch {
+        // Legacy bootstrap is best-effort; ignore if disabled or missing.
+      }
+    }
+
+    // 2. Hydrate React state from storage.
+    reloadFromStorage()
+    setDestinationsLoaded(true)
+
+    // 3. Static model catalog from the backend (no secrets, safe to cache).
     try {
-      const [settingsRes, modelsRes] = await Promise.all([
-        fetch('/api/settings'),
-        fetch('/api/settings/models'),
-      ])
-      const settingsData = await settingsRes.json()
-      const modelsData = await modelsRes.json()
-      
-      if (settingsData.status === 'success') {
-        setSettings(settingsData.settings)
-      }
-      if (modelsData.status === 'success') {
-        setAvailableModels(modelsData.models)
-      }
-    } catch (error) {
-      console.error('Failed to load settings:', error)
+      const models = await api.models()
+      if (models.status === 'success') setAvailableModels(models.models)
+    } catch (e) {
+      console.error('Failed to load model catalog:', e)
+    }
+
+    // 4. Probe MCP health for the active destination (if any).
+    if (storage.getActiveDestination()) {
+      checkMcpHealth()
     }
   }
 
-  const loadDestinations = async () => {
-    try {
-      const response = await fetch('/api/destinations')
-      const data = await response.json()
-      if (data.status === 'success') {
-        setDestinations(data.destinations)
-        const active = data.destinations.find(d => d.is_active)
-        setActiveDestination(active || null)
-      }
-    } catch (error) {
-      console.error('Failed to load destinations:', error)
-    } finally {
-      setDestinationsLoaded(true)
-    }
-  }
-
-  const switchDestination = async (destId) => {
-    try {
-      const response = await fetch(`/api/destinations/${destId}/activate`, { method: 'POST' })
-      const data = await response.json()
-      if (data.status === 'success') {
-        await loadDestinations()
-        checkMcpHealth()
-        // Clear messages when switching consoles for clean context
-        setMessages([])
-        setCurrentInvestigationId(null)
-      }
-    } catch (error) {
-      console.error('Failed to switch destination:', error)
-    }
+  const switchDestination = (destId) => {
+    storage.setActiveDestination(destId)
+    reloadFromStorage()
+    startNewConversation()
     setShowConsoleSelector(false)
+    checkMcpHealth()
   }
 
   // Auto-open settings if no destinations are configured
@@ -1814,10 +2662,13 @@ function App() {
   }, [messages])
 
   const checkMcpHealth = async () => {
+    if (!storage.getActiveDestination()) {
+      setMcpStatus({ status: 'unconfigured' })
+      return
+    }
     setIsCheckingStatus(true)
     try {
-      const response = await fetch('/api/mcp-health')
-      const data = await response.json()
+      const data = await api.mcpHealth()
       setMcpStatus(data)
     } catch (error) {
       setMcpStatus({ status: 'unhealthy', error: error.message })
@@ -2363,64 +3214,195 @@ function App() {
     const query = queryText || input.trim()
     if (!query || isLoading) return
 
+    // Snapshot pending evidences so we can bind them to this user message.
+    const attachedEvidences = pendingEvidences
+    const attachedEvidenceIds = attachedEvidences.map((e) => e.id)
+
     const userMessage = {
       id: Date.now(),
       content: query,
       isUser: true,
       timestamp: new Date().toISOString(),
+      evidenceIds: attachedEvidenceIds,
     }
 
-    // Build conversation history for context
-    const conversationHistory = [...messages, userMessage].map(msg => ({
+    // Build an "enhanced" user turn that injects small text-like evidences
+    // inline so the LLM can actually read them. Binaries and large files are
+    // referenced by metadata only to avoid token bloat. (Vision payloads for
+    // images are deferred to a follow-up — backend support needed.)
+    let enhancedContent = query
+    if (attachedEvidences.length) {
+      const INLINE_LIMIT = 64 * 1024 // 64 KB per text file
+      const lines = ['', '', '---', '**Attached evidence:**']
+      for (const ev of attachedEvidences) {
+        const kind = evidenceStore.classifyEvidence(ev)
+        const base = `- \`${ev.name}\` (${ev.mime || 'unknown'}, ${evidenceStore.formatBytes(ev.size)}, sha256 \`${(ev.sha256 || '').slice(0, 12)}\`)`
+        if (kind === 'text' && ev.size <= INLINE_LIMIT) {
+          try {
+            const text = await evidenceStore.readEvidenceAsText(ev.id, { maxBytes: INLINE_LIMIT })
+            if (text != null) {
+              const ext = (ev.name.match(/\.([a-z0-9]+)$/i) || [, ''])[1] || ''
+              lines.push(base + ' — inlined below:')
+              lines.push('```' + ext)
+              lines.push(text)
+              lines.push('```')
+              continue
+            }
+          } catch {}
+        }
+        lines.push(base + (kind === 'image' ? ' — image (not inlined; vision support pending)' : ''))
+      }
+      enhancedContent = query + '\n' + lines.join('\n')
+    }
+
+    // Build conversation history for context. Use the enhanced content only
+    // for the outgoing request; keep the pure query on the UI bubble.
+    const conversationHistory = [...messages, { ...userMessage, content: enhancedContent }].map(msg => ({
       role: msg.isUser ? 'user' : 'assistant',
       content: msg.content,
     }))
 
+    // Clear the composer's pending list — they're now owned by the message.
+    setPendingEvidences([])
+
     setMessages((prev) => [...prev, userMessage])
     setInput('')
     setIsLoading(true)
+    setThinkingSteps([])
+
+    // Convert one SSE event from the backend into a timeline step, and
+    // merge it with existing steps. We keep the list compact by collapsing
+    // matching start/complete pairs (e.g. agent_start → agent_complete)
+    // into a single row that flips from "in progress" to "done".
+    const stepStart = Date.now()
+    let finalResult = null
+    let finalError = null
+    let finalMeta = { agent: null, toolsUsed: [], thoughtProcess: null }
+
+    const appendOrCompleteStep = (ev) => {
+      const now = Date.now()
+      const key = stepKey(ev)
+
+      // Completion events that should flip an existing in-flight step
+      const completeMap = {
+        agent_complete: 'agent_start',
+        tool_result: 'tool_call',
+        tools_discovered: 'discovering_tools',
+      }
+      const opensKey = completeMap[ev.event]
+
+      setThinkingSteps((prev) => {
+        // If this event completes a prior one, mark that row done
+        if (opensKey) {
+          const openKey = ev.event === 'agent_complete'
+            ? `agent:${ev.data?.agent}`
+            : ev.event === 'tool_result'
+              ? `tool:${ev.data?.agent}:${ev.data?.tool}`
+              : 'discovering_tools'
+          const idx = [...prev].reverse().findIndex((s) => s.key === openKey && !s.done)
+          if (idx !== -1) {
+            const realIdx = prev.length - 1 - idx
+            const next = [...prev]
+            next[realIdx] = {
+              ...next[realIdx],
+              done: true,
+              isError: !!ev.data?.is_error,
+              ms: now - next[realIdx].startedAt,
+              detail: ev.event === 'tools_discovered' ? `${ev.data?.count ?? '?'} tools` : next[realIdx].detail,
+            }
+            return next
+          }
+        }
+
+        // Ignore duplicate keys (e.g. re-emitted agent_start) — keep the first
+        if (prev.some((s) => s.key === key && !s.done)) return prev
+
+        // Otherwise append a new row
+        let label = STEP_LABELS[ev.event] || ev.event
+        let detail = ''
+        if (ev.event === 'connecting_mcp') detail = ev.data?.url || ''
+        else if (ev.event === 'routing') {
+          const agents = ev.data?.agents || []
+          detail = agents.length ? agents.join(', ') : ''
+          label = ev.data?.multi_agent ? 'Routing to multiple agents' : 'Routing to specialist'
+        }
+        else if (ev.event === 'agent_start') { label = 'Running'; detail = ev.data?.agent || '' }
+        else if (ev.event === 'tool_call')   { label = 'Calling tool'; detail = `${ev.data?.agent || ''} · ${ev.data?.tool || ''}` }
+        else if (ev.event === 'synthesizing') detail = (ev.data?.agents || []).join(' + ')
+
+        return [
+          ...prev,
+          { key, label, detail, done: false, startedAt: now, isError: false },
+        ]
+      })
+    }
 
     try {
-      const response = await fetch('/api/query', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ query, conversation_history: conversationHistory }),
+      const agentNames = new Set()
+      const toolsSeen = new Set()
+      await streamQuery(query, conversationHistory, (ev) => {
+        if (ev.event === 'result') {
+          finalResult = ev.data
+        } else if (ev.event === 'error') {
+          finalError = ev.data?.message || 'Unknown error'
+        } else if (ev.event === 'thought_process') {
+          finalMeta.thoughtProcess = ev.data
+        } else {
+          if (ev.event === 'agent_complete' && ev.data) {
+            if (ev.data.agent && !ev.data.is_error) agentNames.add(ev.data.agent)
+            for (const t of ev.data.tools || []) toolsSeen.add(t)
+          }
+          appendOrCompleteStep(ev)
+        }
       })
+      finalMeta.agent = [...agentNames].join(' + ') || null
+      finalMeta.toolsUsed = [...toolsSeen]
 
-      const data = await response.json()
+      // Mark any still-open steps as complete
+      setThinkingSteps((prev) =>
+        prev.map((s) => (s.done ? s : { ...s, done: true, ms: Date.now() - s.startedAt }))
+      )
 
-      let content = 'I apologize, but I encountered an error processing your request.'
-      if (data.status === 'success' && data.result) {
-        content = typeof data.result === 'string'
-          ? data.result
-          : JSON.stringify(data.result, null, 2)
-      } else if (data.detail) {
-        content = `Error: ${data.detail}`
-      } else if (data.error) {
-        content = `Error: ${data.error}`
+      if (finalError) {
+        setMessages((prev) => [...prev, {
+          id: Date.now() + 1,
+          content: finalError,
+          isUser: false,
+          timestamp: new Date().toISOString(),
+        }])
+      } else if (finalResult) {
+        const content = typeof finalResult.result === 'string'
+          ? finalResult.result
+          : JSON.stringify(finalResult.result, null, 2)
+        setMessages((prev) => [...prev, {
+          id: Date.now() + 1,
+          content,
+          isUser: false,
+          timestamp: new Date().toISOString(),
+          agent: finalMeta.agent,
+          toolsUsed: finalMeta.toolsUsed,
+          thoughtProcess: finalMeta.thoughtProcess,
+          totalMs: Date.now() - stepStart,
+        }])
+      } else {
+        setMessages((prev) => [...prev, {
+          id: Date.now() + 1,
+          content: 'No response received from the backend.',
+          isUser: false,
+          timestamp: new Date().toISOString(),
+        }])
       }
-
-      const aiMessage = {
-        id: Date.now() + 1,
-        content,
-        isUser: false,
-        timestamp: new Date().toISOString(),
-        agent: data.agent || null,
-        toolsUsed: data.tools_used || [],
-        thoughtProcess: data.thought_process || null,
-      }
-
-      setMessages((prev) => [...prev, aiMessage])
     } catch (error) {
-      const errorMessage = {
+      setMessages((prev) => [...prev, {
         id: Date.now() + 1,
         content: `Connection error: ${error.message}. Please ensure the MCP server is running.`,
         isUser: false,
         timestamp: new Date().toISOString(),
-      }
-      setMessages((prev) => [...prev, errorMessage])
+      }])
     } finally {
       setIsLoading(false)
+      // Keep the timeline visible for ~1s so the user can see the final checks
+      setTimeout(() => setThinkingSteps([]), 1200)
     }
   }
 
@@ -2481,30 +3463,32 @@ function App() {
                       <p className="text-[10px] font-semibold text-gray-500 uppercase tracking-wider">Switch Console</p>
                     </div>
                     <div className="max-h-64 overflow-y-auto">
-                      {destinations.map((dest) => (
+                      {destinations.map((dest) => {
+                        const isActive = dest.id === activeDestination?.id
+                        return (
                         <button
                           key={dest.id}
-                          onClick={() => dest.is_active ? setShowConsoleSelector(false) : switchDestination(dest.id)}
+                          onClick={() => isActive ? setShowConsoleSelector(false) : switchDestination(dest.id)}
                           className={`w-full text-left px-3 py-2.5 flex items-start gap-2.5 transition-smooth ${
-                            dest.is_active
+                            isActive
                               ? 'bg-purple-500/10 border-l-2 border-purple-500'
                               : 'hover:bg-white/5 border-l-2 border-transparent'
                           }`}
                         >
-                          <Globe className={`w-4 h-4 mt-0.5 flex-shrink-0 ${dest.is_active ? 'text-purple-400' : 'text-gray-500'}`} />
+                          <Globe className={`w-4 h-4 mt-0.5 flex-shrink-0 ${isActive ? 'text-purple-400' : 'text-gray-500'}`} />
                           <div className="flex-1 min-w-0">
                             <div className="flex items-center gap-2">
-                              <span className={`text-sm font-medium truncate ${dest.is_active ? 'text-white' : 'text-gray-300'}`}>
+                              <span className={`text-sm font-medium truncate ${isActive ? 'text-white' : 'text-gray-300'}`}>
                                 {dest.name}
                               </span>
-                              {dest.is_active && (
+                              {isActive && (
                                 <Check className="w-3.5 h-3.5 text-purple-400 flex-shrink-0" />
                               )}
                             </div>
-                            <p className="text-[11px] text-gray-500 truncate">{dest.console_url}</p>
+                            <p className="text-[11px] text-gray-500 truncate">{dest.consoleUrl}</p>
                           </div>
                         </button>
-                      ))}
+                      )})}
                     </div>
                     <div className="px-3 py-2 border-t border-white/5">
                       <button
@@ -2558,6 +3542,22 @@ function App() {
               <Download className="w-4 h-4 text-purple-400" />
             </button>
             <button
+              onClick={() => setShowExportBundle(true)}
+              disabled={messages.length === 0}
+              className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Export Case Bundle (ZIP with conversation + evidences)"
+            >
+              <Package className="w-4 h-4 text-purple-400" />
+            </button>
+            <button
+              onClick={startNewConversation}
+              disabled={messages.length === 0 && pendingEvidences.length === 0}
+              className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Start a new conversation"
+            >
+              <Plus className="w-4 h-4 text-purple-400" />
+            </button>
+            <button
               onClick={() => setShowLibrary(true)}
               className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth"
               title="Investigation Library"
@@ -2585,10 +3585,27 @@ function App() {
           checkMcpHealth()
         }}
         availableModels={availableModels}
+        onRefreshModels={(provider, models) => {
+          setAvailableModels((prev) => ({ ...prev, [provider]: models }))
+        }}
         destinations={destinations}
+        activeDestinationId={activeDestination?.id || null}
         onDestinationsChange={() => {
-          loadDestinations()
+          reloadFromStorage()
           checkMcpHealth()
+        }}
+      />
+
+      {/* Export Case Bundle Modal */}
+      <ExportBundleModal
+        isOpen={showExportBundle}
+        onClose={() => setShowExportBundle(false)}
+        title={messages[0]?.content?.slice(0, 60) || 'SPECTRA Investigation'}
+        conversationId={conversationKey}
+        messages={messages}
+        meta={{
+          console: activeDestination?.name || null,
+          llm: settings ? `${settings.llm_provider} / ${settings.llm_model}` : null,
         }}
       />
 
@@ -2597,9 +3614,18 @@ function App() {
         isOpen={showLibrary}
         onClose={() => setShowLibrary(false)}
         currentMessages={messages}
+        conversationKey={conversationKey}
+        currentEvidenceIds={Array.from(
+          new Set(
+            messages.flatMap((m) => (m.evidenceIds || []))
+          )
+        )}
         onLoadInvestigation={(investigation) => {
           setMessages(investigation.messages)
           setCurrentInvestigationId(investigation.id)
+          // Rebind evidences to the loaded investigation's id.
+          setPendingEvidences([])
+          setConversationKey(investigation.id)
         }}
       />
 
@@ -2623,20 +3649,20 @@ function App() {
                 <ul className="text-gray-500 text-sm mb-6 space-y-2 text-left max-w-sm mx-auto">
                   <li className="flex items-start gap-2">
                     <span className="text-purple-400">•</span>
-                    The MCP server is running
+                    The Purple MCP server is running and reachable
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="text-purple-400">•</span>
-                    The MCP_SERVER_URL environment variable is correctly configured
+                    The MCP URL in <strong className="text-purple-300">Settings &rarr; Consoles</strong> matches exactly what the server exposes
                   </li>
                   <li className="flex items-start gap-2">
                     <span className="text-purple-400">•</span>
-                    Network connectivity between the UI and MCP server
+                    The SPECTRA backend container can resolve that hostname (see hint below)
                   </li>
                 </ul>
                 {mcpStatus.mcp_server && (
                   <p className="text-xs text-gray-600 mb-4">
-                    Configured URL: {mcpStatus.mcp_server}
+                    Configured URL: <code className="text-gray-400">{mcpStatus.mcp_server}</code>
                   </p>
                 )}
                 {mcpStatus.error && (
@@ -2644,14 +3670,36 @@ function App() {
                     Error: {mcpStatus.error}
                   </p>
                 )}
-                <button
-                  onClick={checkMcpHealth}
-                  disabled={isCheckingStatus}
-                  className="px-8 py-4 bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 rounded-xl font-medium transition-smooth glow-purple flex items-center gap-3 mx-auto disabled:opacity-50"
-                >
-                  <RefreshCw className={`w-5 h-5 ${isCheckingStatus ? 'animate-spin' : ''}`} />
-                  Retry Connection
-                </button>
+                {mcpStatus.error && /name or service not known|no address associated|Errno -[25]|getaddrinfo/i.test(String(mcpStatus.error)) && (
+                  <div className="text-xs text-left max-w-lg mx-auto mb-6 p-3 rounded-lg bg-amber-500/10 border border-amber-500/20 text-amber-200/90">
+                    <p className="font-medium mb-1">DNS hint</p>
+                    <p>
+                      The backend container could not resolve the hostname in the URL above.
+                      If it ends in <code>.orb.local</code>, <code>.docker.internal</code>, a Docker
+                      service name, or any other LAN-only name, make sure the SPECTRA backend
+                      container is on the same Docker network as the MCP server. For OrbStack,
+                      attach the backend to the <code>purple-mcp_default</code> network or use
+                      the host-accessible URL (e.g. <code>http://host.docker.internal:8001</code>).
+                    </p>
+                  </div>
+                )}
+                <div className="flex items-center gap-3 justify-center">
+                  <button
+                    onClick={checkMcpHealth}
+                    disabled={isCheckingStatus}
+                    className="px-8 py-4 bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 rounded-xl font-medium transition-smooth glow-purple flex items-center gap-3 disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-5 h-5 ${isCheckingStatus ? 'animate-spin' : ''}`} />
+                    Retry Connection
+                  </button>
+                  <button
+                    onClick={() => setShowSettings(true)}
+                    className="px-6 py-4 glass border border-purple-500/30 hover:bg-white/10 rounded-xl font-medium transition-smooth flex items-center gap-2 text-purple-300"
+                  >
+                    <Settings className="w-4 h-4" />
+                    Open Settings
+                  </button>
+                </div>
               </div>
             </div>
           ) : messages.length === 0 ? (
@@ -2686,32 +3734,94 @@ function App() {
             </div>
           ) : (
             /* Messages */
-            <div className="flex-1 overflow-y-auto overflow-x-hidden p-6 space-y-4">
-              {messages.map((msg) => (
-                <Message key={msg.id} message={msg} isUser={msg.isUser} />
-              ))}
-              {isLoading && <LoadingIndicator />}
-              <div ref={messagesEndRef} />
-            </div>
+            <ZoneProvider>
+              <div className="flex-1 overflow-y-auto overflow-x-hidden">
+                <div className="sticky top-0 z-10 px-6 pt-4 pb-2 bg-gradient-to-b from-[rgba(10,8,20,0.85)] to-transparent backdrop-blur-sm">
+                  <div className="max-w-4xl mx-auto flex justify-start">
+                    <ZoneControlsBar />
+                  </div>
+                </div>
+                <div className="px-6 pb-6 space-y-4">
+                  {messages.map((msg) => {
+                    // Resolve evidence metadata for chip display on user turns.
+                    const msgEvidences = (msg.evidenceIds || [])
+                      .map((id) => conversationEvidences.find((e) => e.id === id))
+                      .filter(Boolean)
+                    return (
+                      <Message
+                        key={msg.id}
+                        message={msg}
+                        isUser={msg.isUser}
+                        messageEvidences={msgEvidences}
+                      />
+                    )
+                  })}
+                  {isLoading && <ThinkingTimeline steps={thinkingSteps} />}
+                  <div ref={messagesEndRef} />
+                </div>
+              </div>
+            </ZoneProvider>
           )}
 
           {/* Input Area */}
           {isConnected && (
-            <div className="p-4 border-t border-white/5">
+            <div
+              className="p-4 border-t border-white/5"
+              onDragOver={(e) => { e.preventDefault(); setIsDraggingOver(true) }}
+              onDragLeave={() => setIsDraggingOver(false)}
+              onDrop={handleComposerDrop}
+            >
               <div className="max-w-4xl mx-auto">
-                <div className="glass rounded-2xl p-2 flex items-end gap-2">
+                {/* Pending evidence chips */}
+                {pendingEvidences.length > 0 && (
+                  <div className="mb-2 flex flex-wrap gap-1.5">
+                    {pendingEvidences.map((ev) => (
+                      <EvidenceChip
+                        key={ev.id}
+                        evidence={ev}
+                        onRemove={handleRemovePendingEvidence}
+                      />
+                    ))}
+                  </div>
+                )}
+
+                <div
+                  className={
+                    'glass rounded-2xl p-2 flex items-end gap-2 transition-colors ' +
+                    (isDraggingOver ? 'ring-2 ring-purple-400/70 bg-purple-500/10' : '')
+                  }
+                >
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    multiple
+                    className="hidden"
+                    onChange={(e) => { handleAttachFiles(e.target.files); e.target.value = '' }}
+                  />
+                  <button
+                    onClick={() => fileInputRef.current?.click()}
+                    className="p-3 rounded-xl hover:bg-white/10 text-purple-300 transition-smooth"
+                    title="Attach evidence (or drag-and-drop / paste)"
+                  >
+                    <Paperclip className="w-5 h-5" />
+                  </button>
                   <textarea
                     value={input}
                     onChange={(e) => setInput(e.target.value)}
                     onKeyDown={handleKeyPress}
-                    placeholder="Ask about alerts, vulnerabilities, threats, or any security question..."
+                    onPaste={handleComposerPaste}
+                    placeholder={
+                      isDraggingOver
+                        ? 'Drop files to attach as evidence…'
+                        : 'Ask about alerts, vulnerabilities, threats, or drop a file here as evidence…'
+                    }
                     rows={1}
                     className="flex-1 bg-transparent px-4 py-3 resize-none focus:outline-none text-white placeholder-gray-500 max-h-32"
                     style={{ minHeight: '48px' }}
                   />
                   <button
                     onClick={() => handleSendMessage()}
-                    disabled={!input.trim() || isLoading}
+                    disabled={(!input.trim() && pendingEvidences.length === 0) || isLoading}
                     className="p-3 bg-gradient-to-r from-purple-600 to-purple-500 hover:from-purple-500 hover:to-purple-400 disabled:opacity-50 disabled:cursor-not-allowed rounded-xl transition-smooth flex items-center justify-center"
                   >
                     {isLoading ? (

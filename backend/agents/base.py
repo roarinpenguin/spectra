@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 from abc import ABC, abstractmethod
 
-from config import AppConfig
 from llm_providers import LLMProvider
 from mcp_client import MCPClient
 from models import AgentResponse, ToolDefinition
+from session_manager import RequestConfig
 
 logger = logging.getLogger("spectra")
 
@@ -32,8 +32,9 @@ class BaseAgent(ABC):
         query: str,
         conversation_history: list | None,
         mcp_client: MCPClient,
-        config: AppConfig,
+        config: RequestConfig,
         all_tools: list[ToolDefinition],
+        stream: object | None = None,
     ) -> AgentResponse:
         """Execute the agent's task using an agentic tool-calling loop.
 
@@ -68,6 +69,8 @@ class BaseAgent(ABC):
                 tools=agent_tools,
                 conversation_history=conversation_history,
                 max_iterations=10,
+                stream=stream,
+                agent_name=self.name,
             )
             return AgentResponse(
                 agent_name=self.name,

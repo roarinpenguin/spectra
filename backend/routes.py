@@ -1,36 +1,47 @@
-"""SPECTRA FastAPI route handlers."""
+"""SPECTRA FastAPI route handlers (v1.1 — multi-tenant).
+
+In v1.1 SPECTRA became horizontally scalable and multi-user. The browser
+owns all configuration and investigation library data in localStorage and
+forwards it on every request via the `session_config` body field plus an
+`X-Spectra-Session-Id` header. The backend is functionally stateless,
+keeping only a per-session MCPClient cache as a connection-reuse
+optimization (see `session_manager.py`).
+"""
 
 from __future__ import annotations
 
-import re
-import uuid
-from datetime import datetime
-from typing import Any
-
 import asyncio
+import logging
+import re
+from typing import Any, Optional
 
 import httpx
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, Header, HTTPException, Query, Request
 
 from agents.orchestrator import Orchestrator
-from config import config, load_destinations, load_investigations, log_buffer, logger, save_destinations, save_investigations
-from mcp_client import extract_mcp_result, get_mcp_client, reset_mcp_client
+from config import (
+    PROVIDER_MODELS,
+    LEGACY_BOOTSTRAP_ENABLED,
+    load_legacy_bootstrap,
+    log_buffer,
+    logger,
+)
+from llm_providers import friendly_network_error
+from mcp_client import extract_mcp_result
 from metrics import Timer, metrics
 from models import (
-    ConfigUpdateRequest,
-    CreateDestinationRequest,
-    Destination,
-    Investigation,
+    McpHealthRequest,
+    ModelRefreshRequest,
     QueryRequest,
-    SaveInvestigationRequest,
+    SessionConfigPayload,
     ToolRequest,
-    UpdateDestinationRequest,
 )
-from streaming import create_streaming_response, AgentStream, wants_streaming
+from session_manager import RequestConfig, session_manager
+from streaming import AgentStream, create_streaming_response, wants_streaming
 
 router = APIRouter()
 
-# Global orchestrator instance
+# Single orchestrator instance — agents are stateless, safe to share
 orchestrator = Orchestrator()
 
 # Tool category mapping for UI display
@@ -60,52 +71,215 @@ TOOL_CATEGORY_MAP = {
 }
 
 
+SESSION_HEADER = "X-Spectra-Session-Id"
+
+
+def _require_session(session_id: Optional[str]) -> str:
+    if not session_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required header: {SESSION_HEADER}",
+        )
+    return session_id
+
+
+def _build_request_config(payload: Optional[SessionConfigPayload]) -> RequestConfig:
+    """Convert a wire payload into a RequestConfig, with helpful errors."""
+    if payload is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Request body must include 'session_config'",
+        )
+    if not payload.mcp_server_url:
+        raise HTTPException(
+            status_code=400,
+            detail="session_config.mcp_server_url is required (configure a console first)",
+        )
+    return RequestConfig.from_payload(payload.model_dump())
+
+
 # ---------------------------------------------------------------------------
-# Health & Config
+# Health & static catalogs
 # ---------------------------------------------------------------------------
 
 @router.get("/health")
-async def health_check() -> dict[str, str]:
-    return {"status": "healthy"}
+async def health_check() -> dict[str, Any]:
+    return {"status": "healthy", "version": "1.1.0", **session_manager.stats()}
 
 
-@router.get("/api/config")
-async def get_config() -> dict[str, Any]:
-    return {"mcp_server_url": config.mcp_server_url}
+@router.get("/api/settings/models")
+async def get_available_models() -> dict[str, Any]:
+    """Static LLM model catalog — safe to cache on the client."""
+    return {
+        "status": "success",
+        "models": PROVIDER_MODELS,
+        "all_providers": list(PROVIDER_MODELS.keys()),
+    }
 
 
-@router.get("/api/mcp-health")
-async def mcp_health_check() -> dict[str, Any]:
-    result = {
+# ---------------------------------------------------------------------------
+# Live model discovery per API key
+# ---------------------------------------------------------------------------
+# Each helper returns a list[str] of model IDs usable for chat completion
+# with the supplied key. The helpers:
+#   - make a single outbound call
+#   - never log or persist the api_key
+#   - raise HTTPException with the provider's error surfaced to the UI
+
+_MODEL_DISCOVERY_TIMEOUT = 15.0
+
+
+async def _list_openai_models(api_key: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=_MODEL_DISCOVERY_TIMEOUT) as client:
+        r = await client.get(
+            "https://api.openai.com/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=_extract_err(r, "OpenAI"))
+    data = r.json().get("data", [])
+    # Only surface chat-capable families; exclude embeddings / tts / whisper / image.
+    def _is_chat(mid: str) -> bool:
+        mid = mid.lower()
+        if any(skip in mid for skip in ("embedding", "whisper", "tts", "audio", "dall-e", "davinci", "babbage", "moderation", "image")):
+            return False
+        return mid.startswith(("gpt-", "o1", "o3", "o4", "chatgpt-"))
+    ids = sorted({m["id"] for m in data if isinstance(m, dict) and _is_chat(m.get("id", ""))})
+    return ids
+
+
+async def _list_anthropic_models(api_key: str) -> list[str]:
+    async with httpx.AsyncClient(timeout=_MODEL_DISCOVERY_TIMEOUT) as client:
+        r = await client.get(
+            "https://api.anthropic.com/v1/models",
+            headers={
+                "x-api-key": api_key,
+                "anthropic-version": "2023-06-01",
+            },
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=_extract_err(r, "Anthropic"))
+    data = r.json().get("data", [])
+    ids = sorted({m["id"] for m in data if isinstance(m, dict) and m.get("id")}, reverse=True)
+    return ids
+
+
+async def _list_google_models(api_key: str) -> list[str]:
+    # Google's list-models is a public endpoint keyed by query param.
+    async with httpx.AsyncClient(timeout=_MODEL_DISCOVERY_TIMEOUT) as client:
+        r = await client.get(
+            "https://generativelanguage.googleapis.com/v1beta/models",
+            params={"key": api_key},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=r.status_code, detail=_extract_err(r, "Google"))
+    data = r.json().get("models", [])
+    ids: list[str] = []
+    for m in data:
+        if not isinstance(m, dict):
+            continue
+        # Only models that support text generation (exclude embedding/TTS/vision-only).
+        methods = m.get("supportedGenerationMethods") or []
+        if "generateContent" not in methods:
+            continue
+        name = m.get("name", "")
+        # API returns "models/<id>"; strip the prefix.
+        ids.append(name.split("/", 1)[1] if name.startswith("models/") else name)
+    return sorted(set(ids), reverse=True)
+
+
+def _extract_err(r: httpx.Response, provider: str) -> str:
+    try:
+        body = r.json()
+        err = body.get("error")
+        if isinstance(err, dict):
+            return f"{provider}: {err.get('message') or err.get('type') or r.text[:200]}"
+        if isinstance(err, str):
+            return f"{provider}: {err}"
+    except Exception:
+        pass
+    return f"{provider} returned HTTP {r.status_code}: {r.text[:200]}"
+
+
+_MODEL_FETCHERS = {
+    "openai": _list_openai_models,
+    "anthropic": _list_anthropic_models,
+    "google": _list_google_models,
+}
+
+
+@router.post("/api/settings/models/refresh")
+async def refresh_models(request: ModelRefreshRequest) -> dict[str, Any]:
+    """Ask the provider for models actually available to this API key.
+
+    Stateless: the key is used once and discarded. Response shape mirrors
+    the static catalog so the frontend can drop it into the same
+    `availableModels` map.
+    """
+    provider = request.provider.lower().strip()
+    if provider not in _MODEL_FETCHERS:
+        raise HTTPException(status_code=400, detail=f"Unsupported provider: {provider}")
+    if not request.api_key:
+        raise HTTPException(status_code=400, detail="api_key is required")
+
+    try:
+        models = await _MODEL_FETCHERS[provider](request.api_key)
+    except HTTPException:
+        raise
+    except httpx.TimeoutException:
+        raise HTTPException(status_code=504, detail=f"{provider} list-models timed out")
+    except Exception as e:
+        # Never include the api_key in the error payload.
+        raise HTTPException(status_code=502, detail=f"{provider} list-models failed: {e}")
+
+    if not models:
+        raise HTTPException(status_code=404, detail=f"{provider} returned no chat-capable models for this key")
+
+    return {"status": "success", "provider": provider, "models": models}
+
+
+@router.post("/api/mcp-health")
+async def mcp_health_check(request: McpHealthRequest, x_spectra_session_id: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Probe the MCP server defined in `session_config.mcp_server_url`.
+
+    Uses the caller's session_id (if provided) so the per-session MCPClient
+    cache stays coherent with what the browser thinks is "active".
+    """
+    cfg = _build_request_config(request.session_config)
+    mcp_url = cfg.mcp_server_url
+
+    result: dict[str, Any] = {
         "status": "unhealthy",
-        "mcp_server": config.mcp_server_url,
+        "mcp_server": mcp_url,
         "server_name": None,
         "console_url": None,
     }
 
     try:
-        mcp_client = get_mcp_client()
         async with httpx.AsyncClient(timeout=10.0) as client:
-            response = await client.get(f"{config.mcp_server_url}/health")
+            response = await client.get(f"{mcp_url}/health")
             if response.status_code != 200:
                 result["error"] = f"Status {response.status_code}"
                 return result
 
             result["status"] = "healthy"
 
-            try:
-                init_result = await mcp_client.initialize()
-                if "result" in init_result:
-                    server_info = init_result["result"].get("serverInfo", {})
-                    result["server_name"] = server_info.get("name", "Purple MCP")
-
-                    instructions = init_result["result"].get("instructions", "")
-                    if "sentinelone" in instructions.lower():
-                        url_match = re.search(r'https://[^\s]+\.sentinelone\.net', instructions)
-                        if url_match:
-                            result["console_url"] = url_match.group(0)
-            except Exception:
-                pass
+            # Best-effort server identity via initialize (only if we have a session id)
+            if x_spectra_session_id:
+                try:
+                    mcp_client, lock = await session_manager.get_client(x_spectra_session_id, mcp_url)
+                    async with lock, session_manager.semaphore:
+                        init_result = await mcp_client.initialize()
+                    if "result" in init_result:
+                        server_info = init_result["result"].get("serverInfo", {})
+                        result["server_name"] = server_info.get("name", "Purple MCP")
+                        instructions = init_result["result"].get("instructions", "")
+                        if "sentinelone" in instructions.lower():
+                            url_match = re.search(r"https://[^\s]+\.sentinelone\.net", instructions)
+                            if url_match:
+                                result["console_url"] = url_match.group(0)
+                except Exception as e:
+                    logger.debug(f"MCP identity probe failed: {e}")
 
             return result
     except Exception as e:
@@ -117,11 +291,15 @@ async def mcp_health_check() -> dict[str, Any]:
 # Tools
 # ---------------------------------------------------------------------------
 
-@router.get("/api/tools")
-async def list_tools() -> dict[str, Any]:
+@router.post("/api/tools")
+async def list_tools(request: McpHealthRequest, x_spectra_session_id: Optional[str] = Header(None)) -> dict[str, Any]:
+    """List MCP tools available on the caller's chosen MCP server."""
+    sid = _require_session(x_spectra_session_id)
+    cfg = _build_request_config(request.session_config)
     try:
-        mcp_client = get_mcp_client()
-        result = await mcp_client.list_tools()
+        mcp_client, lock = await session_manager.get_client(sid, cfg.mcp_server_url)
+        async with lock, session_manager.semaphore:
+            result = await mcp_client.list_tools()
         if "result" in result and "tools" in result["result"]:
             tools = []
             for tool in result["result"]["tools"]:
@@ -141,10 +319,14 @@ async def list_tools() -> dict[str, Any]:
 
 
 @router.post("/api/tool")
-async def execute_tool(request: ToolRequest) -> dict[str, Any]:
+async def execute_tool(request: ToolRequest, x_spectra_session_id: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Execute a single MCP tool call (used by the legacy direct-call UI)."""
+    sid = _require_session(x_spectra_session_id)
+    cfg = _build_request_config(request.session_config)
     try:
-        mcp_client = get_mcp_client()
-        result = await mcp_client.call_tool(request.tool_name, request.arguments)
+        mcp_client, lock = await session_manager.get_client(sid, cfg.mcp_server_url)
+        async with lock, session_manager.semaphore:
+            result = await mcp_client.call_tool(request.tool_name, request.arguments)
 
         if "error" in result:
             error_msg = result["error"].get("message", "MCP error") if isinstance(result["error"], dict) else str(result["error"])
@@ -153,7 +335,6 @@ async def execute_tool(request: ToolRequest) -> dict[str, Any]:
         content = extract_mcp_result(result)
         if content:
             return {"status": "success", "result": content}
-
         return {"status": "error", "result": "No response from tool"}
 
     except HTTPException:
@@ -167,51 +348,56 @@ async def execute_tool(request: ToolRequest) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 @router.post("/api/query")
-async def execute_query(request: QueryRequest, raw_request: Request):
-    """Execute a natural language query through the multi-agent orchestrator.
+async def execute_query(request: QueryRequest, raw_request: Request, x_spectra_session_id: Optional[str] = Header(None)):
+    """Execute a natural-language query through the multi-agent orchestrator.
 
-    The orchestrator classifies the query and routes it to the appropriate
-    specialist agent (alert_triage, threat_hunt, vulnerability, etc.).
-    All providers (OpenAI, Anthropic, Google) use real function calling.
-
-    Supports SSE streaming when Accept: text/event-stream is sent.
+    Supports SSE streaming when Accept: text/event-stream is present.
     """
+    sid = _require_session(x_spectra_session_id)
+    cfg = _build_request_config(request.session_config)
+
     accept = raw_request.headers.get("accept", "")
 
     if wants_streaming(accept):
-        # SSE streaming mode
         stream = AgentStream()
 
         async def _run():
             try:
-                mcp_client = get_mcp_client()
-                stream.emit("orchestrator_start", {"status": "classifying"})
-                with Timer() as timer:
-                    outcome = await orchestrator.process(
-                        query=request.query,
-                        conversation_history=request.conversation_history,
-                        config=config,
-                        mcp_client=mcp_client,
-                    )
+                stream.emit("connecting_mcp", {"url": cfg.mcp_server_url})
+                mcp_client, lock = await session_manager.get_client(sid, cfg.mcp_server_url)
+                stream.emit("orchestrator_start", {"status": "running"})
+                async with lock, session_manager.semaphore:
+                    with Timer():
+                        outcome = await orchestrator.process(
+                            query=request.query,
+                            conversation_history=request.conversation_history,
+                            config=cfg,
+                            mcp_client=mcp_client,
+                            stream=stream,
+                        )
                 metrics.record_routing(outcome.get("agent", "unknown"), is_multi_agent="+" in outcome.get("agent", ""))
+                # Include thought_process metadata so the UI can replace the
+                # live timeline with the canonical post-run view.
+                stream.emit("thought_process", outcome.get("thought_process", {}))
                 stream.result("success", outcome["result"])
             except Exception as e:
                 logger.error(f"Streaming query error: {e}")
-                stream.error(str(e))
+                stream.error(friendly_network_error(e, provider=cfg.llm_provider))
 
         asyncio.ensure_future(_run())
         return create_streaming_response(stream)
 
-    # Standard JSON response mode
+    # Standard JSON response
     try:
-        mcp_client = get_mcp_client()
-        with Timer() as timer:
-            outcome = await orchestrator.process(
-                query=request.query,
-                conversation_history=request.conversation_history,
-                config=config,
-                mcp_client=mcp_client,
-            )
+        mcp_client, lock = await session_manager.get_client(sid, cfg.mcp_server_url)
+        async with lock, session_manager.semaphore:
+            with Timer():
+                outcome = await orchestrator.process(
+                    query=request.query,
+                    conversation_history=request.conversation_history,
+                    config=cfg,
+                    mcp_client=mcp_client,
+                )
         return {
             "status": "success",
             "result": outcome["result"],
@@ -219,29 +405,28 @@ async def execute_query(request: QueryRequest, raw_request: Request):
             "tools_used": outcome.get("tools_used", []),
             "thought_process": outcome.get("thought_process"),
         }
-
     except HTTPException:
         raise
     except Exception as e:
         logger.error(f"Query error: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=friendly_network_error(e, provider=cfg.llm_provider))
 
 
 @router.get("/api/agents")
 async def list_agents() -> dict[str, Any]:
-    """List all registered specialist agents."""
-    return {
-        "status": "success",
-        "agents": orchestrator.get_agent_descriptions(),
-    }
+    """List all registered specialist agents (static metadata, no MCP call)."""
+    return {"status": "success", "agents": orchestrator.get_agent_descriptions()}
 
 
 @router.post("/api/purple-ai")
-async def purple_ai_query(request: QueryRequest) -> dict[str, Any]:
-    """Execute a Purple AI threat hunting query with optional PowerQuery execution."""
+async def purple_ai_query(request: QueryRequest, x_spectra_session_id: Optional[str] = Header(None)) -> dict[str, Any]:
+    """Direct Purple AI threat-hunting query."""
+    sid = _require_session(x_spectra_session_id)
+    cfg = _build_request_config(request.session_config)
     try:
-        mcp_client = get_mcp_client()
-        result = await mcp_client.call_tool("purple_ai", {"query": request.query})
+        mcp_client, lock = await session_manager.get_client(sid, cfg.mcp_server_url)
+        async with lock, session_manager.semaphore:
+            result = await mcp_client.call_tool("purple_ai", {"query": request.query})
 
         if "error" in result:
             error_msg = result["error"].get("message", "MCP error") if isinstance(result["error"], dict) else str(result["error"])
@@ -250,7 +435,6 @@ async def purple_ai_query(request: QueryRequest) -> dict[str, Any]:
         content = extract_mcp_result(result)
         if not content:
             return {"status": "error", "result": "No response from Purple AI"}
-
         return {"status": "success", "result": content}
 
     except HTTPException:
@@ -277,61 +461,12 @@ async def get_categories() -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# Settings
-# ---------------------------------------------------------------------------
-
-@router.get("/api/settings")
-async def get_settings() -> dict[str, Any]:
-    return {"status": "success", "settings": config.to_dict()}
-
-
-@router.post("/api/settings")
-async def update_settings(request: ConfigUpdateRequest) -> dict[str, Any]:
-    changes_made = []
-
-    if request.mcp_server_url is not None and request.mcp_server_url != config.mcp_server_url:
-        config.mcp_server_url = request.mcp_server_url
-        reset_mcp_client(config.mcp_server_url)
-        changes_made.append("mcp_server_url")
-
-    if request.llm_provider is not None and request.llm_provider != config.llm_provider:
-        config.llm_provider = request.llm_provider
-        if config.llm_provider in config.provider_models:
-            config.llm_model = config.provider_models[config.llm_provider][0]
-        changes_made.append("llm_provider")
-        changes_made.append("llm_model")
-
-    if request.llm_api_key is not None:
-        config.llm_api_key = request.llm_api_key
-        changes_made.append("llm_api_key")
-
-    if request.llm_model is not None and request.llm_model != config.llm_model:
-        config.llm_model = request.llm_model
-        changes_made.append("llm_model")
-
-    saved = False
-    if changes_made:
-        saved = config.save_to_file()
-
-    return {
-        "status": "success",
-        "message": f"Updated: {', '.join(changes_made)}" + (" (saved)" if saved else "") if changes_made else "No changes",
-        "settings": config.to_dict(),
-    }
-
-
-@router.get("/api/settings/models")
-async def get_available_models() -> dict[str, Any]:
-    return {"status": "success", "models": config.provider_models}
-
-
-# ---------------------------------------------------------------------------
-# Logs
+# Logs (memory buffer + docker socket)
 # ---------------------------------------------------------------------------
 
 @router.get("/api/logs")
 async def get_logs(container: str = "backend", lines: int = 100) -> dict[str, Any]:
-    result = {}
+    result: dict[str, Any] = {}
 
     if container in ("backend", "all"):
         backend_logs = log_buffer.get_logs()[-lines:]
@@ -350,13 +485,13 @@ async def get_logs(container: str = "backend", lines: int = 100) -> dict[str, An
                 )
                 if response.status_code == 200:
                     raw_logs = response.content
-                    log_lines = []
+                    log_lines: list[str] = []
                     i = 0
                     while i < len(raw_logs):
                         if i + 8 <= len(raw_logs):
-                            size = int.from_bytes(raw_logs[i+4:i+8], 'big')
+                            size = int.from_bytes(raw_logs[i + 4:i + 8], "big")
                             if i + 8 + size <= len(raw_logs):
-                                line = raw_logs[i+8:i+8+size].decode('utf-8', errors='replace').strip()
+                                line = raw_logs[i + 8:i + 8 + size].decode("utf-8", errors="replace").strip()
                                 if line:
                                     log_lines.append(line)
                             i += 8 + size
@@ -384,286 +519,31 @@ async def get_logs(container: str = "backend", lines: int = 100) -> dict[str, An
 
 
 # ---------------------------------------------------------------------------
-# Investigations
-# ---------------------------------------------------------------------------
-
-@router.get("/api/investigations")
-async def list_investigations() -> dict[str, Any]:
-    investigations = load_investigations()
-    inv_list = sorted(
-        [inv.model_dump() for inv in investigations.values()],
-        key=lambda x: x["updated_at"],
-        reverse=True
-    )
-    return {"status": "success", "investigations": inv_list, "count": len(inv_list)}
-
-
-@router.get("/api/investigations/{investigation_id}")
-async def get_investigation(investigation_id: str) -> dict[str, Any]:
-    investigations = load_investigations()
-    if investigation_id not in investigations:
-        raise HTTPException(status_code=404, detail="Investigation not found")
-    return {"status": "success", "investigation": investigations[investigation_id].model_dump()}
-
-
-@router.post("/api/investigations")
-async def save_investigation(request: SaveInvestigationRequest) -> dict[str, Any]:
-    investigations = load_investigations()
-    now = datetime.utcnow().isoformat() + "Z"
-
-    if request.investigation_id and request.investigation_id in investigations:
-        inv_id = request.investigation_id
-        investigation = Investigation(
-            id=inv_id,
-            title=request.title,
-            description=request.description,
-            messages=request.messages,
-            created_at=investigations[inv_id].created_at,
-            updated_at=now,
-            tags=request.tags,
-        )
-        action = "updated"
-    else:
-        inv_id = str(uuid.uuid4())[:8]
-        investigation = Investigation(
-            id=inv_id,
-            title=request.title,
-            description=request.description,
-            messages=request.messages,
-            created_at=now,
-            updated_at=now,
-            tags=request.tags,
-        )
-        action = "created"
-
-    investigations[inv_id] = investigation
-
-    if save_investigations(investigations):
-        logger.info(f"Investigation {action}: {inv_id} - {request.title}")
-        return {"status": "success", "message": f"Investigation {action}", "investigation": investigation.model_dump()}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to save investigation")
-
-
-@router.delete("/api/investigations/{investigation_id}")
-async def delete_investigation(investigation_id: str) -> dict[str, Any]:
-    investigations = load_investigations()
-    if investigation_id not in investigations:
-        raise HTTPException(status_code=404, detail="Investigation not found")
-
-    title = investigations[investigation_id].title
-    del investigations[investigation_id]
-
-    if save_investigations(investigations):
-        logger.info(f"Investigation deleted: {investigation_id} - {title}")
-        return {"status": "success", "message": "Investigation deleted"}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to delete investigation")
-
-
-# ---------------------------------------------------------------------------
-# Destinations (Multi-Console)
-# ---------------------------------------------------------------------------
-
-@router.get("/api/destinations")
-async def list_destinations() -> dict[str, Any]:
-    """List all configured console destinations."""
-    destinations = load_destinations()
-    dest_list = sorted(
-        [d.model_dump() for d in destinations.values()],
-        key=lambda x: x["updated_at"],
-        reverse=True,
-    )
-    # Mask API tokens in response
-    for d in dest_list:
-        if d.get("api_token"):
-            d["api_token_preview"] = d["api_token"][:8] + "..." if len(d["api_token"]) > 8 else "****"
-            d["api_token_set"] = True
-        else:
-            d["api_token_preview"] = ""
-            d["api_token_set"] = False
-        del d["api_token"]
-    return {"status": "success", "destinations": dest_list, "count": len(dest_list)}
-
-
-@router.get("/api/destinations/active")
-async def get_active_destination() -> dict[str, Any]:
-    """Get the currently active destination."""
-    destinations = load_destinations()
-    for d in destinations.values():
-        if d.is_active:
-            result = d.model_dump()
-            # Mask token
-            if result.get("api_token"):
-                result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else "****"
-                result["api_token_set"] = True
-            else:
-                result["api_token_preview"] = ""
-                result["api_token_set"] = False
-            del result["api_token"]
-            return {"status": "success", "destination": result}
-    return {"status": "success", "destination": None}
-
-
-@router.post("/api/destinations")
-async def create_destination(request: CreateDestinationRequest) -> dict[str, Any]:
-    """Create a new console destination."""
-    destinations = load_destinations()
-    now = datetime.utcnow().isoformat() + "Z"
-    dest_id = str(uuid.uuid4())[:8]
-
-    # If this is the first destination, make it active
-    is_first = len(destinations) == 0
-
-    destination = Destination(
-        id=dest_id,
-        name=request.name,
-        console_url=request.console_url,
-        api_token=request.api_token,
-        mcp_server_url=request.mcp_server_url,
-        is_active=is_first,
-        last_used=now if is_first else None,
-        created_at=now,
-        updated_at=now,
-    )
-
-    destinations[dest_id] = destination
-
-    if save_destinations(destinations):
-        logger.info(f"Destination created: {dest_id} - {request.name}")
-        # If first destination, activate it (update MCP client)
-        if is_first:
-            config.mcp_server_url = request.mcp_server_url
-            config.save_to_file()
-            reset_mcp_client(request.mcp_server_url)
-            logger.info(f"Auto-activated first destination: {request.name}")
-
-        result = destination.model_dump()
-        result["api_token_set"] = bool(result["api_token"])
-        result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
-        del result["api_token"]
-        return {"status": "success", "message": "Destination created", "destination": result}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to save destination")
-
-
-@router.put("/api/destinations/{dest_id}")
-async def update_destination(dest_id: str, request: UpdateDestinationRequest) -> dict[str, Any]:
-    """Update an existing destination."""
-    destinations = load_destinations()
-    if dest_id not in destinations:
-        raise HTTPException(status_code=404, detail="Destination not found")
-
-    dest = destinations[dest_id]
-    now = datetime.utcnow().isoformat() + "Z"
-    changes = []
-
-    if request.name is not None and request.name != dest.name:
-        dest.name = request.name
-        changes.append("name")
-    if request.console_url is not None and request.console_url != dest.console_url:
-        dest.console_url = request.console_url
-        changes.append("console_url")
-    if request.api_token is not None and request.api_token != "":
-        dest.api_token = request.api_token
-        changes.append("api_token")
-    if request.mcp_server_url is not None and request.mcp_server_url != dest.mcp_server_url:
-        dest.mcp_server_url = request.mcp_server_url
-        changes.append("mcp_server_url")
-        # If this is the active destination, update the MCP client
-        if dest.is_active:
-            config.mcp_server_url = request.mcp_server_url
-            config.save_to_file()
-            reset_mcp_client(request.mcp_server_url)
-
-    if changes:
-        dest.updated_at = now
-        destinations[dest_id] = dest
-        if save_destinations(destinations):
-            logger.info(f"Destination updated: {dest_id} - changed: {', '.join(changes)}")
-            result = dest.model_dump()
-            result["api_token_set"] = bool(result["api_token"])
-            result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
-            del result["api_token"]
-            return {"status": "success", "message": f"Updated: {', '.join(changes)}", "destination": result}
-        else:
-            raise HTTPException(status_code=500, detail="Failed to save destination")
-
-    return {"status": "success", "message": "No changes"}
-
-
-@router.delete("/api/destinations/{dest_id}")
-async def delete_destination(dest_id: str) -> dict[str, Any]:
-    """Delete a destination."""
-    destinations = load_destinations()
-    if dest_id not in destinations:
-        raise HTTPException(status_code=404, detail="Destination not found")
-
-    was_active = destinations[dest_id].is_active
-    name = destinations[dest_id].name
-    del destinations[dest_id]
-
-    # If deleted destination was active, activate the most recently used one
-    if was_active and destinations:
-        remaining = sorted(
-            destinations.values(),
-            key=lambda d: d.last_used or d.created_at,
-            reverse=True,
-        )
-        remaining[0].is_active = True
-        remaining[0].last_used = datetime.utcnow().isoformat() + "Z"
-        config.mcp_server_url = remaining[0].mcp_server_url
-        config.save_to_file()
-        reset_mcp_client(remaining[0].mcp_server_url)
-        logger.info(f"Auto-activated destination: {remaining[0].name}")
-
-    if save_destinations(destinations):
-        logger.info(f"Destination deleted: {dest_id} - {name}")
-        return {"status": "success", "message": "Destination deleted"}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to delete destination")
-
-
-@router.post("/api/destinations/{dest_id}/activate")
-async def activate_destination(dest_id: str) -> dict[str, Any]:
-    """Set a destination as the active one and switch MCP connection."""
-    destinations = load_destinations()
-    if dest_id not in destinations:
-        raise HTTPException(status_code=404, detail="Destination not found")
-
-    now = datetime.utcnow().isoformat() + "Z"
-
-    # Deactivate all, activate the selected one
-    for d in destinations.values():
-        d.is_active = False
-
-    dest = destinations[dest_id]
-    dest.is_active = True
-    dest.last_used = now
-    dest.updated_at = now
-    destinations[dest_id] = dest
-
-    if save_destinations(destinations):
-        # Switch MCP client to this destination
-        config.mcp_server_url = dest.mcp_server_url
-        config.save_to_file()
-        reset_mcp_client(dest.mcp_server_url)
-        logger.info(f"Activated destination: {dest.name} ({dest.mcp_server_url})")
-
-        result = dest.model_dump()
-        result["api_token_set"] = bool(result["api_token"])
-        result["api_token_preview"] = result["api_token"][:8] + "..." if len(result["api_token"]) > 8 else ""
-        del result["api_token"]
-        return {"status": "success", "message": f"Switched to {dest.name}", "destination": result}
-    else:
-        raise HTTPException(status_code=500, detail="Failed to save destination")
-
-
-# ---------------------------------------------------------------------------
 # Metrics
 # ---------------------------------------------------------------------------
 
 @router.get("/api/metrics")
 async def get_metrics() -> dict[str, Any]:
-    """Get agent, tool, and orchestrator performance metrics."""
-    return {"status": "success", "metrics": metrics.get_metrics()}
+    """Process-wide agent / tool / orchestrator metrics."""
+    return {
+        "status": "success",
+        "metrics": metrics.get_metrics(),
+        "sessions": session_manager.stats(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy bootstrap (one-shot migration from v1.0 → v1.1)
+# ---------------------------------------------------------------------------
+
+@router.get("/api/legacy/bootstrap")
+async def legacy_bootstrap() -> dict[str, Any]:
+    """Return any v1.0 settings/destinations/investigations files still on disk.
+
+    The frontend calls this exactly once on first load (when localStorage is
+    empty) so users upgrading from v1.0 don't lose their config. Disable
+    permanently with `SPECTRA_LEGACY_BOOTSTRAP=0`.
+    """
+    if not LEGACY_BOOTSTRAP_ENABLED:
+        return {"status": "disabled", "data": {}}
+    return {"status": "success", "data": load_legacy_bootstrap()}

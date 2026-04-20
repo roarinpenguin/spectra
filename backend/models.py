@@ -1,80 +1,89 @@
-"""SPECTRA Pydantic models."""
+"""SPECTRA Pydantic models (v1.1 — multi-tenant)."""
 
 from __future__ import annotations
 
-from typing import Any, Literal, Optional
+from typing import Any, Optional
 
 from pydantic import BaseModel, Field
 
 
+# ---------------------------------------------------------------------------
+# Per-request session config (browser-supplied, never persisted)
+# ---------------------------------------------------------------------------
+
+class LLMConfigPayload(BaseModel):
+    """LLM configuration sent inline by the browser on each query."""
+    provider: str = Field(default="openai", description="openai | anthropic | google")
+    model: str = Field(default="", description="Model identifier")
+    api_key: str = Field(default="", description="LLM API key")
+
+
+class SessionConfigPayload(BaseModel):
+    """Per-request session configuration carried in the request body.
+
+    The browser sends this on every endpoint that needs to talk to MCP
+    or an LLM. The backend never persists it.
+    """
+    mcp_server_url: str = Field(default="", description="Purple MCP server URL")
+    llm: LLMConfigPayload = Field(default_factory=LLMConfigPayload)
+
+
+# ---------------------------------------------------------------------------
+# Conversation / query models
+# ---------------------------------------------------------------------------
+
 class ConversationMessage(BaseModel):
-    """A single message in the conversation history."""
-    role: Literal["user", "assistant"] = Field(..., description="Message role")
-    content: str = Field(..., description="Message content")
+    """A single message in conversation history."""
+    role: str
+    content: str
 
 
 class QueryRequest(BaseModel):
-    """Natural language query request."""
-    query: str = Field(..., description="Natural language query for Purple AI")
-    conversation_history: list[ConversationMessage] = Field(
-        default_factory=list,
-        description="Previous conversation messages for context"
-    )
+    """A natural-language query from the frontend."""
+    query: str
+    conversation_history: Optional[list[ConversationMessage]] = None
+    session_config: Optional[SessionConfigPayload] = None
 
 
 class ToolRequest(BaseModel):
-    """MCP tool execution request."""
-    tool_name: str = Field(..., description="Name of the MCP tool to execute")
-    arguments: dict[str, Any] = Field(default_factory=dict, description="Tool arguments")
+    """A direct MCP tool invocation from the frontend."""
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    session_config: Optional[SessionConfigPayload] = None
 
 
-class ConfigUpdateRequest(BaseModel):
-    """Configuration update request."""
-    mcp_server_url: Optional[str] = Field(None, description="MCP server URL")
-    llm_provider: Optional[Literal["anthropic", "openai", "google"]] = Field(None, description="LLM provider")
-    llm_api_key: Optional[str] = Field(None, description="LLM API key")
-    llm_model: Optional[str] = Field(None, description="LLM model name")
+class McpHealthRequest(BaseModel):
+    """A targeted MCP health probe for a specific server URL."""
+    session_config: SessionConfigPayload
 
 
-class InvestigationMessage(BaseModel):
-    """A message in an investigation."""
-    id: int = Field(..., description="Message ID")
-    content: str = Field(..., description="Message content")
-    isUser: bool = Field(..., description="Whether message is from user")
-    timestamp: str = Field(..., description="ISO timestamp")
+class ModelRefreshRequest(BaseModel):
+    """Ask the backend to list models actually available to a given API key.
+
+    The api_key is used for a single outbound call and is never logged or
+    stored. Returned to clarify which models the user's key can actually
+    invoke, instead of relying on SPECTRA's static catalog.
+    """
+    provider: str = Field(description="openai | anthropic | google")
+    api_key: str = Field(description="LLM API key")
 
 
-class Investigation(BaseModel):
-    """A saved investigation/chat session."""
-    id: str = Field(..., description="Unique investigation ID")
-    title: str = Field(..., description="Investigation title")
-    description: str = Field(default="", description="Brief description")
-    messages: list[InvestigationMessage] = Field(default_factory=list, description="Chat messages")
-    created_at: str = Field(..., description="Creation timestamp")
-    updated_at: str = Field(..., description="Last update timestamp")
-    tags: list[str] = Field(default_factory=list, description="Tags for categorization")
-
-
-class SaveInvestigationRequest(BaseModel):
-    """Request to save an investigation."""
-    title: str = Field(..., description="Investigation title")
-    description: str = Field(default="", description="Brief description")
-    messages: list[InvestigationMessage] = Field(..., description="Chat messages to save")
-    tags: list[str] = Field(default_factory=list, description="Tags for categorization")
-    investigation_id: Optional[str] = Field(None, description="Existing ID to update, or None for new")
-
+# ---------------------------------------------------------------------------
+# Tool / agent definitions
+# ---------------------------------------------------------------------------
 
 class ToolDefinition(BaseModel):
-    """MCP tool definition with schema."""
+    """An MCP tool surfaced to the LLM."""
     name: str
     description: str = ""
     input_schema: dict[str, Any] = Field(default_factory=dict)
 
 
 class ToolResult(BaseModel):
-    """Result from an MCP tool execution."""
+    """Result of executing an MCP tool."""
     tool_name: str
-    content: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result: str = ""
     is_error: bool = False
 
 
@@ -85,32 +94,3 @@ class AgentResponse(BaseModel):
     tools_called: list[str] = Field(default_factory=list)
     tool_calls_sequence: list[dict] = Field(default_factory=list)
     is_error: bool = False
-
-
-class Destination(BaseModel):
-    """A configured SentinelOne console destination."""
-    id: str = Field(..., description="Unique destination ID")
-    name: str = Field(..., description="Display name for this console")
-    console_url: str = Field(..., description="SentinelOne console base URL")
-    api_token: str = Field(default="", description="SentinelOne API token")
-    mcp_server_url: str = Field(..., description="Purple MCP server URL for this console")
-    is_active: bool = Field(default=False, description="Whether this is the active destination")
-    last_used: Optional[str] = Field(default=None, description="ISO timestamp of last use")
-    created_at: str = Field(..., description="Creation timestamp")
-    updated_at: str = Field(..., description="Last update timestamp")
-
-
-class CreateDestinationRequest(BaseModel):
-    """Request to create a new destination."""
-    name: str = Field(..., description="Display name")
-    console_url: str = Field(..., description="SentinelOne console base URL")
-    api_token: str = Field(default="", description="SentinelOne API token")
-    mcp_server_url: str = Field(..., description="Purple MCP server URL")
-
-
-class UpdateDestinationRequest(BaseModel):
-    """Request to update a destination."""
-    name: Optional[str] = Field(None, description="Display name")
-    console_url: Optional[str] = Field(None, description="SentinelOne console base URL")
-    api_token: Optional[str] = Field(None, description="SentinelOne API token")
-    mcp_server_url: Optional[str] = Field(None, description="Purple MCP server URL")

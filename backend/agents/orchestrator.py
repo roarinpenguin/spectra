@@ -14,10 +14,10 @@ from agents.correlation import CorrelationAgent
 from agents.posture import PostureAgent
 from agents.threat_hunt import ThreatHuntAgent
 from agents.vulnerability import VulnerabilityAgent
-from config import AppConfig
 from llm_providers import LLMProvider
 from mcp_client import MCPClient
 from models import AgentResponse, ToolDefinition
+from session_manager import RequestConfig
 
 logger = logging.getLogger("spectra")
 
@@ -103,7 +103,7 @@ class Orchestrator:
         ]
 
     async def classify(
-        self, query: str, config: AppConfig, mcp_client: MCPClient
+        self, query: str, config: RequestConfig, mcp_client: MCPClient
     ) -> list[str]:
         """Classify a query and return the best agent name(s).
 
@@ -202,8 +202,9 @@ Nothing else."""
         self,
         query: str,
         conversation_history: list | None,
-        config: AppConfig,
+        config: RequestConfig,
         mcp_client: MCPClient,
+        stream: Any | None = None,
     ) -> dict[str, Any]:
         """Process a query through the orchestrator.
 
@@ -212,22 +213,46 @@ Nothing else."""
         3. Route to single or multiple agents
         4. Synthesize multi-agent results if needed
 
+        If ``stream`` is provided, progress events are emitted at each
+        checkpoint so the UI can render a live timeline. Events used:
+            discovering_tools, tools_discovered, classifying,
+            routing, agent_start, agent_complete, synthesizing.
+
         Returns:
             Dict with 'result' (str), 'agent' (str), 'tools_used' (list[str]).
         """
+        if stream:
+            stream.emit("discovering_tools", {"status": "running"})
         all_tools = await mcp_client.discover_tools()
         logger.info(f"Orchestrator processing query with {len(all_tools)} tools available")
+        if stream:
+            stream.emit("tools_discovered", {"count": len(all_tools)})
 
+        if stream:
+            stream.emit("classifying", {"status": "running"})
         agent_names = await self.classify(query, config, mcp_client)
 
         # Filter out "general" from the list
         specialist_names = [n for n in agent_names if n != "general" and n in self.agents]
 
+        if stream:
+            stream.emit("routing", {
+                "agents": specialist_names or ["general"],
+                "multi_agent": len(specialist_names) > 1,
+            })
+
         if not specialist_names:
             # No specialist matched — use general with all tools
+            if stream:
+                stream.agent_start("general")
             result = await self._run_general(
-                query, conversation_history, config, mcp_client, all_tools
+                query, conversation_history, config, mcp_client, all_tools, stream=stream
             )
+            if stream:
+                stream.emit("agent_complete", {
+                    "agent": "general",
+                    "tools": result.get("tools_used", []),
+                })
             result["thought_process"] = {
                 "classification": "general",
                 "reason": "No specialist agent matched",
@@ -240,19 +265,32 @@ Nothing else."""
             # Single agent routing
             agent = self.agents[specialist_names[0]]
             logger.info(f"Routing to specialist agent: {agent.name}")
+            if stream:
+                stream.agent_start(agent.name)
             response = await agent.execute(
                 query=query,
                 conversation_history=conversation_history,
                 mcp_client=mcp_client,
                 config=config,
                 all_tools=all_tools,
+                stream=stream,
             )
+            if stream:
+                stream.emit("agent_complete", {
+                    "agent": agent.name,
+                    "tools": response.tools_called,
+                    "is_error": response.is_error,
+                })
 
             if response.is_error:
                 logger.warning(f"Agent {agent.name} returned error, falling back to general")
+                if stream:
+                    stream.agent_start("general")
                 result = await self._run_general(
-                    query, conversation_history, config, mcp_client, all_tools
+                    query, conversation_history, config, mcp_client, all_tools, stream=stream
                 )
+                if stream:
+                    stream.emit("agent_complete", {"agent": "general", "tools": result.get("tools_used", [])})
                 result["thought_process"] = {
                     "classification": f"{agent.name} (fallback to general)",
                     "reason": f"{agent.name} agent returned an error",
@@ -276,18 +314,38 @@ Nothing else."""
         logger.info(f"Multi-agent routing to: {specialist_names}")
         agents_to_run = [self.agents[n] for n in specialist_names]
 
-        responses = await asyncio.gather(
-            *[
-                agent.execute(
+        if stream:
+            for a in agents_to_run:
+                stream.agent_start(a.name)
+
+        # Use as_completed so we can emit agent_complete events in real time
+        async def _run_one(agent):
+            try:
+                resp = await agent.execute(
                     query=query,
                     conversation_history=conversation_history,
                     mcp_client=mcp_client,
                     config=config,
                     all_tools=all_tools,
+                    stream=stream,
                 )
-                for agent in agents_to_run
-            ],
-            return_exceptions=True,
+                if stream:
+                    stream.emit("agent_complete", {
+                        "agent": agent.name,
+                        "tools": resp.tools_called,
+                        "is_error": resp.is_error,
+                    })
+                return resp
+            except Exception as e:
+                if stream:
+                    stream.emit("agent_complete", {
+                        "agent": agent.name, "tools": [], "is_error": True, "error": str(e),
+                    })
+                return e
+
+        responses = await asyncio.gather(
+            *[_run_one(a) for a in agents_to_run],
+            return_exceptions=False,
         )
 
         # Collect successful results
@@ -309,9 +367,13 @@ Nothing else."""
                 logger.warning(f"Agent {agents_to_run[i].name} returned error")
 
         if not agent_results:
+            if stream:
+                stream.agent_start("general")
             result = await self._run_general(
-                query, conversation_history, config, mcp_client, all_tools
+                query, conversation_history, config, mcp_client, all_tools, stream=stream
             )
+            if stream:
+                stream.emit("agent_complete", {"agent": "general", "tools": result.get("tools_used", [])})
             result["thought_process"] = {
                 "classification": f"{', '.join(specialist_names)} (all failed, fallback to general)",
                 "reason": "All specialist agents failed",
@@ -333,6 +395,8 @@ Nothing else."""
             }
 
         # Synthesize multiple agent results
+        if stream:
+            stream.emit("synthesizing", {"agents": agent_labels})
         synthesized = await self._synthesize(query, agent_results, config, mcp_client)
         return {
             "result": synthesized,
@@ -349,7 +413,7 @@ Nothing else."""
         self,
         query: str,
         responses: list[AgentResponse],
-        config: AppConfig,
+        config: RequestConfig,
         mcp_client: MCPClient,
     ) -> str:
         """Synthesize results from multiple specialist agents into a single response."""
@@ -381,9 +445,10 @@ Synthesize these findings into a single comprehensive response."""
         self,
         query: str,
         conversation_history: list | None,
-        config: AppConfig,
+        config: RequestConfig,
         mcp_client: MCPClient,
         all_tools: list[ToolDefinition],
+        stream: Any | None = None,
     ) -> dict[str, Any]:
         """Run a general query with all available tools."""
         logger.info("Running general agent with all tools")
@@ -393,6 +458,8 @@ Synthesize these findings into a single comprehensive response."""
             user_query=query,
             tools=all_tools,
             conversation_history=conversation_history,
+            stream=stream,
+            agent_name="general",
         )
         return {
             "result": result,

@@ -10,12 +10,71 @@ from typing import Any
 
 import httpx
 
-from config import AppConfig
 from mcp_client import MCPClient, extract_mcp_result
+from session_manager import RequestConfig
 from models import ToolDefinition
 from tool_converter import mcp_to_anthropic, mcp_to_google, mcp_to_openai
 
 logger = logging.getLogger("spectra")
+
+
+# ---------------------------------------------------------------------------
+# Friendly network errors
+# ---------------------------------------------------------------------------
+# Low-level failures in httpx surface as "[Errno -5] No address associated
+# with hostname" or "[Errno -2] Name or service not known" — unhelpful for
+# SOC analysts. This helper translates the common cases into actionable
+# messages that get streamed back through the SSE error event and also
+# returned as the agent response body on the non-streaming path.
+
+_PROVIDER_HOSTS = {
+    "openai": "api.openai.com",
+    "anthropic": "api.anthropic.com",
+    "google": "generativelanguage.googleapis.com",
+}
+
+
+def friendly_network_error(exc: Exception, provider: str = "") -> str:
+    """Translate a low-level httpx / socket error into an actionable message."""
+    host = _PROVIDER_HOSTS.get(provider, "the LLM provider")
+    msg = str(exc)
+    name = type(exc).__name__
+
+    # DNS / name resolution
+    if any(s in msg for s in ("No address associated with hostname", "Name or service not known", "nodename nor servname")) \
+            or name in ("gaierror",):
+        return (
+            f"**Cannot resolve `{host}`.** The backend container failed DNS lookup.\n\n"
+            f"Likely causes:\n"
+            f"- No internet access from the backend container\n"
+            f"- Corporate proxy / firewall blocking outbound DNS\n"
+            f"- Wrong `dns:` section in `docker-compose.yml`\n\n"
+            f"Try: `docker compose exec backend nslookup {host}`. If it fails, fix the container's DNS "
+            f"(e.g. add `dns: [1.1.1.1, 8.8.8.8]` to the backend service in `docker-compose.yml`)."
+        )
+
+    # Connection refused / unreachable
+    if isinstance(exc, httpx.ConnectError) or "ConnectError" in name or "Connection refused" in msg:
+        return (
+            f"**Cannot connect to `{host}`** ({exc}).\n\n"
+            f"The hostname resolved but the TCP connection could not be established. "
+            f"Check whether your network allows outbound HTTPS (port 443) to `{host}`."
+        )
+
+    # Timeouts
+    if isinstance(exc, httpx.TimeoutException) or "Timeout" in name:
+        return (
+            f"**Request to `{host}` timed out.**\n\n"
+            f"Either the LLM took too long to respond or the network between the backend and `{host}` is slow. "
+            f"Try again; if it persists, consider switching to a faster model."
+        )
+
+    # TLS / SSL
+    if "SSL" in msg or "certificate" in msg.lower():
+        return f"**TLS error contacting `{host}`**: {exc}"
+
+    # Fallback
+    return f"**LLM call failed** ({name}): {exc}"
 
 
 def _detect_powerquery(text: str) -> str | None:
@@ -73,6 +132,8 @@ async def execute_mcp_tool(
     arguments: dict,
     tools_log: list[str] | None = None,
     tool_calls_sequence: list[dict] | None = None,
+    stream: Any | None = None,
+    agent_name: str = "",
 ) -> str:
     """Execute an MCP tool and return the result as a string.
 
@@ -84,14 +145,24 @@ async def execute_mcp_tool(
 
     If tool_calls_sequence is provided, appends an ordered record of each call
     with tool name and a brief args summary for the thought-process trace.
+
+    If stream is provided, emits ``tool_call`` / ``tool_result`` SSE events so
+    the UI can render live progress.
     """
     if tools_log is not None and tool_name not in tools_log:
         tools_log.append(tool_name)
 
+    args_preview = _summarize_args(arguments)
     if tool_calls_sequence is not None:
         tool_calls_sequence.append({
             "tool": tool_name,
-            "args": _summarize_args(arguments),
+            "args": args_preview,
+        })
+    if stream is not None:
+        stream.emit("tool_call", {
+            "agent": agent_name,
+            "tool": tool_name,
+            "args_preview": args_preview,
         })
 
     try:
@@ -136,16 +207,30 @@ async def execute_mcp_tool(
 
         if len(content) > 50000:
             content = content[:50000] + "\n\n... [truncated]"
+        if stream is not None:
+            stream.emit("tool_result", {
+                "agent": agent_name,
+                "tool": tool_name,
+                "is_error": False,
+                "bytes": len(content),
+            })
         return content
 
     except Exception as e:
+        if stream is not None:
+            stream.emit("tool_result", {
+                "agent": agent_name,
+                "tool": tool_name,
+                "is_error": True,
+                "error": str(e)[:200],
+            })
         return f"Tool error: {str(e)}"
 
 
 class LLMProvider:
     """Unified LLM provider with agentic function calling for all providers."""
 
-    def __init__(self, config: AppConfig, mcp_client: MCPClient):
+    def __init__(self, config: RequestConfig, mcp_client: MCPClient):
         self.config = config
         self.mcp_client = mcp_client
 
@@ -156,6 +241,8 @@ class LLMProvider:
         tools: list[ToolDefinition],
         conversation_history: list | None = None,
         max_iterations: int = 10,
+        stream: Any | None = None,
+        agent_name: str = "",
     ) -> tuple[str, list[str], list[dict]]:
         """Run an agentic tool-calling loop with the configured LLM provider.
 
@@ -168,20 +255,25 @@ class LLMProvider:
         if not self.config.llm_api_key:
             return "**LLM not configured.** Please configure an API key in Settings.", tools_log, tool_calls_sequence
 
-        if self.config.llm_provider == "openai":
-            result = await self._run_openai_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
-            )
-        elif self.config.llm_provider == "anthropic":
-            result = await self._run_anthropic_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
-            )
-        elif self.config.llm_provider == "google":
-            result = await self._run_google_loop(
-                system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence
-            )
-        else:
-            result = f"Unknown LLM provider: {self.config.llm_provider}"
+        try:
+            if self.config.llm_provider == "openai":
+                result = await self._run_openai_loop(
+                    system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence, stream, agent_name,
+                )
+            elif self.config.llm_provider == "anthropic":
+                result = await self._run_anthropic_loop(
+                    system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence, stream, agent_name,
+                )
+            elif self.config.llm_provider == "google":
+                result = await self._run_google_loop(
+                    system_prompt, user_query, tools, conversation_history, max_iterations, tools_log, tool_calls_sequence, stream, agent_name,
+                )
+            else:
+                result = f"Unknown LLM provider: {self.config.llm_provider}"
+        except Exception as e:
+            # Convert low-level network/DNS errors into a user-friendly message
+            # so the UI shows something actionable instead of e.g. "[Errno -5]".
+            result = friendly_network_error(e, provider=self.config.llm_provider)
 
         return result, tools_log, tool_calls_sequence
 
@@ -236,6 +328,8 @@ class LLMProvider:
         max_iterations: int,
         tools_log: list[str] | None = None,
         tool_calls_sequence: list[dict] | None = None,
+        stream: Any | None = None,
+        agent_name: str = "",
     ) -> str:
         openai_tools = mcp_to_openai(tools)
         messages = [{"role": "system", "content": system_prompt}]
@@ -287,7 +381,10 @@ class LLMProvider:
                         arguments = {}
 
                     logger.info(f"OpenAI calling tool: {tool_name}")
-                    tool_result = await execute_mcp_tool(self.mcp_client, tool_name, arguments, tools_log, tool_calls_sequence)
+                    tool_result = await execute_mcp_tool(
+                        self.mcp_client, tool_name, arguments,
+                        tools_log, tool_calls_sequence, stream, agent_name,
+                    )
 
                     messages.append({
                         "role": "tool",
@@ -333,6 +430,8 @@ class LLMProvider:
         max_iterations: int,
         tools_log: list[str] | None = None,
         tool_calls_sequence: list[dict] | None = None,
+        stream: Any | None = None,
+        agent_name: str = "",
     ) -> str:
         anthropic_tools = mcp_to_anthropic(tools)
         messages = []
@@ -391,7 +490,8 @@ class LLMProvider:
 
                         logger.info(f"Anthropic calling tool: {tool_name}")
                         tool_output = await execute_mcp_tool(
-                            self.mcp_client, tool_name, tool_input, tools_log, tool_calls_sequence
+                            self.mcp_client, tool_name, tool_input,
+                            tools_log, tool_calls_sequence, stream, agent_name,
                         )
 
                         tool_results.append({
@@ -438,6 +538,8 @@ class LLMProvider:
         max_iterations: int,
         tools_log: list[str] | None = None,
         tool_calls_sequence: list[dict] | None = None,
+        stream: Any | None = None,
+        agent_name: str = "",
     ) -> str:
         google_tools = mcp_to_google(tools)
         contents = []
@@ -498,7 +600,8 @@ class LLMProvider:
 
                     logger.info(f"Google calling tool: {tool_name}")
                     tool_output = await execute_mcp_tool(
-                        self.mcp_client, tool_name, tool_args, tools_log, tool_calls_sequence
+                        self.mcp_client, tool_name, tool_args,
+                        tools_log, tool_calls_sequence, stream, agent_name,
                     )
 
                     function_responses.append({

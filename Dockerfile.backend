@@ -15,5 +15,8 @@ COPY backend/ /app/
 # Expose port
 EXPOSE 8080
 
-# Run the application
-CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Run the application.
+# WEB_CONCURRENCY controls the number of uvicorn workers (default 1).
+# For >30 concurrent users behind nginx you may want WEB_CONCURRENCY=2-4.
+ENV WEB_CONCURRENCY=1
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port 8080 --proxy-headers --workers ${WEB_CONCURRENCY}"]

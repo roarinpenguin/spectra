@@ -187,21 +187,6 @@ def extract_mcp_result(result: dict[str, Any]) -> str:
     return ""
 
 
-# Global MCP client instance
-_mcp_client: MCPClient | None = None
-
-
-def get_mcp_client() -> MCPClient:
-    """Get the global MCP client instance."""
-    global _mcp_client
-    if _mcp_client is None:
-        from config import config
-        _mcp_client = MCPClient(config.mcp_server_url)
-    return _mcp_client
-
-
-def reset_mcp_client(server_url: str) -> MCPClient:
-    """Reset the global MCP client with a new server URL."""
-    global _mcp_client
-    _mcp_client = MCPClient(server_url)
-    return _mcp_client
+# NOTE: As of v1.1, MCP clients are managed per-session by SessionManager
+# (see session_manager.py). The previous module-level singleton has been
+# removed to support multi-tenant horizontal scalability.

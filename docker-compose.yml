@@ -6,16 +6,20 @@ services:
       dockerfile: Dockerfile.backend
     container_name: spectra-backend
     environment:
-      # Configure the MCP server URL - default assumes MCP server is on host
-      MCP_SERVER_URL: ${MCP_SERVER_URL:-http://host.docker.internal:8000}
-      # OpenAI API key for LLM (can also be configured via UI)
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
-      # Anthropic API key (alternative provider)
-      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
-      # LLM model to use (optional, defaults to gpt-5.2)
-      LLM_MODEL: ${LLM_MODEL:-gpt-5.2}
+      # ----- v1.1 multi-tenant tunables (all optional) -----
+      # Number of uvicorn workers (raise for >30 concurrent users)
+      WEB_CONCURRENCY: ${WEB_CONCURRENCY:-1}
+      # Per-process limits for the in-memory MCPClient cache
+      SPECTRA_SESSION_TTL: ${SPECTRA_SESSION_TTL:-1800}
+      SPECTRA_MAX_SESSIONS: ${SPECTRA_MAX_SESSIONS:-200}
+      SPECTRA_MAX_CONCURRENT_MCP: ${SPECTRA_MAX_CONCURRENT_MCP:-50}
+      # One-shot migration of v1.0 single-tenant config to the first
+      # browser that loads. Set to 0 to disable on hardened deployments.
+      SPECTRA_LEGACY_BOOTSTRAP: ${SPECTRA_LEGACY_BOOTSTRAP:-1}
     volumes:
-      # Persistent storage for configuration (API keys, MCP URL, etc.)
+      # OPTIONAL in v1.1 — kept only so legacy bootstrap can find any
+      # pre-v1.1 settings.json / destinations.json / investigations.json
+      # files. Safe to remove on a fresh install.
       - spectra-config:/app/config
       # Docker socket for container logs access (troubleshooting)
       - /var/run/docker.sock:/var/run/docker.sock:ro
@@ -23,6 +27,18 @@ services:
       - "8080"
     extra_hosts:
       - "host.docker.internal:host-gateway"
+    # NOTE on DNS: we deliberately do NOT override the `dns:` list here so
+    # that Docker's embedded resolver (which also handles OrbStack's
+    # `.orb.local` hostnames and Docker service discovery) keeps working.
+    # If your environment has no upstream resolver at all and you see
+    # "[Errno -5] No address associated with hostname" for PUBLIC hostnames
+    # like api.openai.com, uncomment the block below to hard-code public
+    # resolvers — but be aware this will break resolution of any LAN-only
+    # names (including `.orb.local`, OpenShift service names, etc.):
+    #
+    # dns:
+    #   - 1.1.1.1
+    #   - 8.8.8.8
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://localhost:8080/health"]

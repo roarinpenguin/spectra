@@ -9,6 +9,119 @@
 ![SPECTRA](https://img.shields.io/badge/SPECTRA-Security%20Assistant-8B5CF6?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
+![Version](https://img.shields.io/badge/version-1.2.0-8B5CF6?style=for-the-badge)
+
+---
+
+## 🆕 What's new in **v1.2 — April 2026**
+
+**Conversations become investigation case files.**
+
+v1.2 turns a SPECTRA "conversation" from a pure chat log into a full
+investigation artefact: you can **upload evidences** (binaries, JSON, logs,
+ZIPs, images, PCAPs, screenshots, …), export the whole thing as a portable
+**Case Bundle (ZIP)**, and steer the visual density of the chat with a new
+**Zones** toolbar.
+
+### Highlights
+
+- **📎 Evidence uploads.** Drag-and-drop onto the composer, paste a screenshot,
+  or click the paperclip. Files are stored **entirely in your browser**
+  (IndexedDB) against the current conversation. Binaries, logs, PCAPs, JSON,
+  ZIPs, images — all supported. Small text/JSON files (≤ 64 KB) are
+  automatically inlined into the LLM's context so the agent can actually
+  reason over their contents; larger / binary files are referenced by name,
+  size, MIME and SHA-256 to avoid token bloat.
+- **📦 Case Bundle export (ZIP).** New toolbar button opens an export modal
+  with per-section checkboxes: **Markdown conversation** (always on), **PDF**,
+  **agent artefacts** (thought process + tool calls as JSON), **uploaded
+  evidences** (originals + per-file `.meta.json` sidecars), and an optional
+  **redact secrets** pass. Every bundle includes a canonical `messages.json`
+  (redacted inline when the toggle is on) that makes it **round-trippable**
+  on import. The bundle also ships
+  with `manifest.json` (schema version + SHA-256 checksums) and a
+  human-readable `README.txt`. Assembled client-side with
+  [`fflate`](https://github.com/101arrowz/fflate); no bytes touch the backend.
+- **📥 Case Bundle import.** The Investigation Library now has an **Import
+  bundle** button. Drop any `.zip` produced by SPECTRA and the importer
+  validates the manifest, verifies SHA-256 checksums per evidence, restores
+  the conversation from `messages.json`, and re-inserts every evidence into
+  IndexedDB (deduping by SHA-256). If an investigation with the same id
+  already exists, a conflict dialog lets you **keep both** (rename incoming),
+  **replace** the existing one, or **cancel**. Bundles without `messages.json`
+  (pre-v2 exports only — the current exporter always writes it) fall back to
+  parsing `conversation.md` — message text round-trips, but thought process,
+  tool calls and evidence links are not recovered and the UI flags this as a
+  **degraded import**.
+- **🧭 Chat Zones.** A sticky toolbar above the chat lets you expand or
+  collapse *categories* across every message in one click: **Exec**
+  (executive summaries / TL;DR), **Actions** (recommended actions /
+  remediation), **Findings** (everything else), **Thoughts** (per-message
+  thought process), **Tools** (tool-call list), **Evidence**. Presets include
+  *Expand all*, *Collapse all*, *Only exec*, *Exec + actions*. Per-card
+  clicks still work and are remembered until the next preset.
+- **➕ One-click New Conversation.** A dedicated toolbar button starts a fresh
+  conversation with a new evidence container, without touching the library.
+- **🧠 Evidence-aware LLM.** The user turn sent to the model is transparently
+  augmented with the attached evidence. Small text is inlined in fenced code
+  blocks; every file gets a metadata line (name, MIME, size, short SHA-256).
+  Vision-model payloads for images are staged for the next release.
+- **🖼️ Browser-owned storage.** True to the v1.1 contract, evidences live in
+  IndexedDB only — the backend never sees them (and never persists anything
+  about them). They are bound to the investigation id, so saving a
+  conversation from the library keeps evidences linked without a migration
+  step.
+- **📝 MARP slide export — on the roadmap.** Design notes parked in
+  [`docs/MARP_IDEAS.md`](docs/MARP_IDEAS.md). Upcoming: one-click executive
+  deck (Idea A) and full-screen "Threat story" presentation mode (Idea B).
+
+### Dependency added
+
+- `fflate ^0.8.2` in the frontend (small, pure-JS, streaming ZIP assembler).
+
+### Upgrading from v1.1
+
+1. `git pull && docker compose build && docker compose up -d`
+2. The frontend image will be rebuilt with the new `fflate` dependency.
+3. Clear site data only if your browser reports a stale IndexedDB schema —
+   otherwise existing investigations are preserved.
+4. No backend changes required; the Case Bundle is assembled entirely in the
+   browser.
+
+---
+
+## 🆕 What's new in **v1.1 — April 2026**
+
+**Multi-tenant, horizontally scalable, browser-owned state.**
+
+SPECTRA v1.1 is a major architectural upgrade that turns the previously single-tenant deployment into a shared service that 20–30 SOC analysts can use independently from a single Docker stack — each with their own consoles, API keys, LLM settings, and investigation library.
+
+### Highlights
+
+- **👤 Multi-user, no login required.** Every browser is its own tenant. State is keyed by a per-browser session UUID generated lazily on first visit; nothing is shared between users on the same backend.
+- **💾 Browser-owned state.** Consoles, SentinelOne API tokens, LLM provider/key/model, and the entire investigation library live in `localStorage`. The backend stores **zero** user data and is fully restartable without losing user config.
+- **🔐 Encrypted Vault export/import.** A new **Settings → Vault & Privacy** tab lets you export your entire state as a passphrase-encrypted JSON file (AES-GCM-256 + PBKDF2-SHA256 with 600 000 iterations, all via the browser's Web Crypto API). Restore from any browser/device by importing the same file. A plain-text export is also available behind a confirmation prompt.
+- **🛡️ Sensitive Mode.** Optional toggle that keeps API keys and console tokens in browser memory only — wiped on reload. Useful on shared / kiosk machines.
+- **⚖️ Horizontal scalability.** The backend is functionally stateless. It maintains an in-memory per-session `MCPClient` cache (TTL-evicted, LRU-capped) only as a connection-reuse optimization. Tunable via env vars: `WEB_CONCURRENCY`, `SPECTRA_MAX_SESSIONS`, `SPECTRA_SESSION_TTL`, `SPECTRA_MAX_CONCURRENT_MCP`. Run `docker compose up --scale backend=N` behind nginx for additional capacity.
+- **🧱 Per-session MCP isolation.** Each browser holds its own JSON-RPC session with Purple MCP via a process-wide semaphore that protects upstream from thundering-herd traffic.
+- **🧾 One-shot legacy migration.** The first browser to load a freshly upgraded v1.1 backend automatically inherits any pre-v1.1 `settings.json` / `destinations.json` / `investigations.json` files. Disable with `SPECTRA_LEGACY_BOOTSTRAP=0`.
+- **🔒 Hardened defaults.** Strict Content-Security-Policy from nginx (no inline scripts, `connect-src 'self'`, `frame-ancestors 'none'`), `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, `Cache-Control: no-store` on every `/api/*` response, and a backend log redactor that strips API keys and bearer tokens before they reach the in-memory log buffer or `/api/logs`.
+- **🧠 Live "thinking" timeline.** Instead of a bland spinner, every query shows a real-time step-by-step trace of what the backend is doing (connecting to MCP, discovering tools, classifying intent, routing to specialists, calling each tool, synthesizing) with per-step durations, spinner → check / × transitions, and zero round-trips — all delivered over SSE.
+- **🔁 Live model discovery.** Settings → LLM Configuration → **Refresh from API key** queries the provider (OpenAI, Anthropic, Google) and replaces the static model list with the ones your key can actually invoke. The key is used for exactly one outbound call and never persisted or logged.
+- **🩺 Friendly network errors.** Low-level failures (`[Errno -5] No address associated with hostname`, `ConnectError`, timeouts, TLS problems) are translated into actionable markdown messages naming the exact host that failed and how to fix it. The default Docker Compose now ships with `dns: [1.1.1.1, 8.8.8.8]` on the backend so hostnames resolve reliably out of the box.
+
+### Breaking changes
+
+- The backend `settings.json`, `destinations.json` and `investigations.json` files are no longer used at runtime. They are read **once** by `/api/legacy/bootstrap` and then become inert. The Docker volume `spectra-config` is now optional.
+- These endpoints have been removed: `GET/POST /api/settings`, `GET/POST/PUT/DELETE /api/destinations*`, `GET/POST/DELETE /api/investigations*`. All of that data is now browser-side.
+- `GET /api/mcp-health`, `POST /api/tools`, `POST /api/tool`, `POST /api/query`, `POST /api/purple-ai` now require the `X-Spectra-Session-Id` header and a `session_config` payload in the request body.
+- The `MCP_SERVER_URL` env var (single-tenant default) is no longer consulted; each browser configures its own per-console MCP URL.
+
+### Upgrading from v1.0
+
+1. `git pull && docker compose build && docker compose up -d`
+2. Open SPECTRA in your browser — if `localStorage` is empty and the legacy files exist on the volume, your previous configuration loads automatically. Open **Settings → Vault & Privacy → Encrypted Export** and save your first vault file.
+3. (Optional) On hardened deployments, set `SPECTRA_LEGACY_BOOTSTRAP=0` and remove the `spectra-config` volume mount.
 
 ---
 
@@ -42,8 +155,20 @@ SPECTRA is an AI-powered security investigation assistant that provides SOC anal
 | **PDF Export** | Export investigations as branded PDF reports with charts and tables |
 | **Chart Visualizations** | Automatic pie/bar charts for tabular data and Mermaid diagram rendering |
 | **Investigation Library** | Save, load, rename, and continue investigations |
-| **Multi-Destination** | Configure multiple SentinelOne console connections |
-| **Persistent Config** | Settings survive container restarts via Docker volumes |
+| **Multi-Destination** | Configure multiple SentinelOne console connections per browser |
+| **Multi-Tenant** *(v1.1)* | 20–30 independent users on a single Docker stack, each with isolated state |
+| **Browser-Owned State** *(v1.1)* | Consoles, API keys, library all stored in `localStorage` — backend is stateless |
+| **Encrypted Vault** *(v1.1)* | Passphrase-encrypted export/import (AES-GCM-256 + PBKDF2 via Web Crypto) |
+| **Sensitive Mode** *(v1.1)* | In-memory secrets only — wiped on reload |
+| **Horizontal Scalability** *(v1.1)* | `docker compose up --scale backend=N` behind nginx |
+| **Thinking Timeline** *(v1.1)* | Real-time SSE-driven step list with per-step durations |
+| **Live Model Discovery** *(v1.1)* | One-click refresh lists models your API key can actually invoke |
+| **Friendly Network Errors** *(v1.1)* | DNS / connect / TLS failures translated into actionable messages |
+| **Evidence Uploads** *(v1.2)* | Drag-drop / paste / pick files — stored in IndexedDB, bound to the conversation |
+| **Case Bundle Export** *(v1.2)* | Single ZIP with Markdown + optional PDF + agent artefacts + original evidences + manifest |
+| **Case Bundle Import** *(v1.2)* | Re-hydrate any SPECTRA ZIP: validates SHA-256, dedupes evidences, conflict resolution dialog |
+| **Chat Zones** *(v1.2)* | One-click expand/collapse categories (Exec, Actions, Findings, Thoughts, Tools, Evidence) |
+| **Evidence-aware LLM** *(v1.2)* | Small text/JSON inlined into the model's context; binaries referenced by metadata |
 | **Modern UI** | Purple-themed glass morphism design with responsive layout |
 
 ---

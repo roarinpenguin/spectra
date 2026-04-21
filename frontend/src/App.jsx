@@ -41,6 +41,9 @@ import {
   Archive,
   FileCode,
   Package,
+  Presentation,
+  Play,
+  StickyNote,
 } from 'lucide-react'
 import ReactMarkdown from 'react-markdown'
 import * as storage from './storage'
@@ -49,6 +52,7 @@ import { api, streamQuery } from './api'
 import { encryptVault, decryptVault, downloadVault, downloadPlain, pickJsonFile } from './crypto'
 import { exportCaseBundle } from './bundleExport'
 import { inspectBundle, importBundle } from './bundleImport'
+import { renderDeck, wrapStandalone, inferDeckTitle } from './marpRenderer'
 import {
   ZoneProvider,
   ZoneControlsBar,
@@ -2298,6 +2302,7 @@ function ExportBundleModal({
     includePdf: false,
     includeArtefacts: true,
     includeEvidences: true,
+    includeDeck: false,
     redact: false,
   })
   const [evidenceCount, setEvidenceCount] = useState(0)
@@ -2339,6 +2344,7 @@ function ExportBundleModal({
           includePdf: opts.includePdf,
           includeArtefacts: opts.includeArtefacts,
           includeEvidences: opts.includeEvidences,
+          includeDeck: opts.includeDeck,
           redact: opts.redact,
         },
         pdfBlob,
@@ -2413,6 +2419,11 @@ function ExportBundleModal({
               desc={`evidences/ folder with originals + .meta.json sidecars. ${evidenceStore.formatBytes(evidenceSize)} total.`}
               disabled={evidenceCount === 0}
             />
+            <Row
+              k="includeDeck"
+              label="MARP slide deck (HTML)"
+              desc="deck.html — standalone executive briefing (cover, exec summary, per-agent findings, evidence gallery, MITRE mapping, actions). Open in any browser; print to PDF from there."
+            />
             <Row k="redact" label="Redact secrets" desc="Best-effort scrubbing of bearer tokens, API keys, long secret-shaped strings." />
           </div>
 
@@ -2444,6 +2455,318 @@ function ExportBundleModal({
       </div>
     </div>
   )
+}
+
+// ---------------------------------------------------------------------------
+// SlideShadow — renders a Marpit slide inside a Shadow DOM so the deck's
+// theme CSS (which expects a pristine user-agent stylesheet) is fully
+// isolated from Tailwind's Preflight resets. Without this, Tailwind's
+// `h1 { font-size: inherit }` and list resets silently defeat the theme.
+// ---------------------------------------------------------------------------
+function SlideShadow({ html, css, className, style, onClick }) {
+  const hostRef = useRef(null)
+  const rootRef = useRef(null)
+  const styleElRef = useRef(null)
+  const contentRef = useRef(null)
+
+  useEffect(() => {
+    const host = hostRef.current
+    if (!host) return
+    if (!rootRef.current) {
+      rootRef.current = host.attachShadow({ mode: 'open' })
+      styleElRef.current = document.createElement('style')
+      contentRef.current = document.createElement('div')
+      contentRef.current.style.cssText = 'display: contents;'
+      rootRef.current.appendChild(styleElRef.current)
+      rootRef.current.appendChild(contentRef.current)
+    }
+    if (styleElRef.current.textContent !== (css || '')) {
+      styleElRef.current.textContent = css || ''
+    }
+    if (contentRef.current.innerHTML !== (html || '')) {
+      contentRef.current.innerHTML = html || ''
+    }
+  }, [html, css])
+
+  return <div ref={hostRef} className={className} style={style} onClick={onClick} />
+}
+
+// ---------------------------------------------------------------------------
+// Present mode — full-screen MARP deck viewer (Idea B).
+// ---------------------------------------------------------------------------
+//
+// Renders the current conversation as an in-app slide show with keyboard
+// navigation. Speaker notes are lifted from each assistant message's
+// `thoughtProcess` (classification, reason, tool calls) so the presenter
+// sees the rationale the audience doesn't.
+//
+//   ← / →    previous / next slide
+//   Home / End  first / last slide
+//   b        blank (black) screen
+//   s        toggle speaker notes
+//   Esc      exit
+//
+function PresentModal({
+  isOpen,
+  onClose,
+  title,
+  messages,
+  meta,
+  evidences, // already resolved with dataUrl for images
+}) {
+  const [deck, setDeck] = useState(null) // { slides, css }
+  const [idx, setIdx] = useState(0)
+  const [blank, setBlank] = useState(false)
+  const [showNotes, setShowNotes] = useState(false)
+  const [error, setError] = useState(null)
+
+  // Build the deck once per (re)open. Image evidences are lazily resolved
+  // to data URLs so the gallery slide can show thumbnails.
+  useEffect(() => {
+    if (!isOpen) return
+    let cancelled = false
+    ;(async () => {
+      try {
+        const resolved = await Promise.all((evidences || []).map(async (ev) => {
+          if (!String(ev.mime || '').startsWith('image/')) return ev
+          try {
+            const dataUrl = await evidenceStore.readEvidenceAsDataUrl(ev.id)
+            return { ...ev, dataUrl }
+          } catch { return ev }
+        }))
+        if (cancelled) return
+        const rendered = renderDeck({ title, messages, evidences: resolved, meta })
+        setDeck({ slides: rendered.slides, css: rendered.css })
+        setIdx(0)
+        setBlank(false)
+        setError(null)
+      } catch (e) {
+        if (cancelled) return
+        console.error('[Present] render failed:', e)
+        setError(e.message || String(e))
+      }
+    })()
+    return () => { cancelled = true }
+  }, [isOpen, title, messages, evidences, meta])
+
+  // Build speaker notes per slide from assistant messages' thoughtProcess.
+  // Slide index alignment: slide 0 = cover, slide 1 = exec summary,
+  // slides 2..N = per-agent findings. We key by assistant message index.
+  const speakerNotes = useMemo(() => {
+    const notes = []
+    for (const m of messages || []) {
+      if (m.isUser) continue
+      const tp = m.thoughtProcess
+      if (!tp) continue
+      const parts = []
+      if (tp.classification) parts.push(`**Classification:** ${tp.classification}`)
+      if (tp.reason) parts.push(`**Reason:** ${tp.reason}`)
+      if (tp.tool_calls?.length) {
+        parts.push('**Tool calls:**')
+        for (const tc of tp.tool_calls) {
+          parts.push(`- \`${tc.tool}\`${tc.args ? ` — ${tc.args}` : ''}`)
+        }
+      }
+      notes.push(parts.join('\n'))
+    }
+    return notes
+  }, [messages])
+
+  const total = deck?.slides?.length || 0
+
+  // Keyboard bindings.
+  useEffect(() => {
+    if (!isOpen) return
+    const onKey = (e) => {
+      if (e.key === 'Escape') { e.preventDefault(); onClose(); return }
+      if (e.key === 'ArrowRight' || e.key === 'PageDown' || e.key === ' ') {
+        e.preventDefault(); setIdx((i) => Math.min(i + 1, total - 1)); return
+      }
+      if (e.key === 'ArrowLeft' || e.key === 'PageUp') {
+        e.preventDefault(); setIdx((i) => Math.max(i - 1, 0)); return
+      }
+      if (e.key === 'Home') { e.preventDefault(); setIdx(0); return }
+      if (e.key === 'End') { e.preventDefault(); setIdx(total - 1); return }
+      if (e.key === 'b' || e.key === 'B') { e.preventDefault(); setBlank((v) => !v); return }
+      if (e.key === 's' || e.key === 'S') { e.preventDefault(); setShowNotes((v) => !v); return }
+    }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [isOpen, onClose, total])
+
+  if (!isOpen) return null
+
+  return (
+    <div className="fixed inset-0 z-[60] bg-[#030208] flex flex-col">
+      {/* Top chrome — auto-hides on mouse-idle for a cleaner presentation. */}
+      <div className="present-chrome flex items-center justify-between px-5 py-2.5 bg-gradient-to-b from-black/70 to-transparent backdrop-blur-sm z-10">
+        <div className="flex items-center gap-3 text-xs text-gray-400">
+          <Presentation className="w-4 h-4 text-purple-400" />
+          <span className="font-medium text-gray-200 truncate max-w-[40ch]">{title}</span>
+          {total > 0 && (
+            <span className="text-gray-500">
+              Slide <span className="text-purple-300 font-semibold">{idx + 1}</span> / {total}
+            </span>
+          )}
+        </div>
+        <div className="flex items-center gap-2 text-xs text-gray-400">
+          <span className="hidden lg:flex items-center gap-1.5">
+            <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/10 rounded text-[10px]">←</kbd>
+            <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/10 rounded text-[10px]">→</kbd>
+            <span className="mx-1">navigate</span>
+            <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/10 rounded text-[10px]">B</kbd>
+            <span className="mx-1">blank</span>
+            <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/10 rounded text-[10px]">S</kbd>
+            <span className="mx-1">notes</span>
+            <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/10 rounded text-[10px]">Esc</kbd>
+            <span className="ml-1">exit</span>
+          </span>
+          <button
+            onClick={() => setShowNotes((v) => !v)}
+            className={
+              'p-2 rounded-lg hover:bg-white/10 transition-smooth ' +
+              (showNotes ? 'bg-purple-500/20 text-purple-200 ring-1 ring-purple-400/40' : 'text-gray-400')
+            }
+            title="Speaker notes (S)"
+          >
+            <StickyNote className="w-4 h-4" />
+          </button>
+          <button
+            onClick={onClose}
+            className="p-2 rounded-lg hover:bg-white/10 transition-smooth text-gray-400"
+            title="Exit (Esc)"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {/* Stage */}
+      <div className="flex-1 flex items-center justify-center overflow-hidden relative">
+        {/* Ambient glow */}
+        <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_center,rgba(168,85,247,0.12),transparent_60%)]" />
+
+        {error && (
+          <div className="text-red-300 p-6 bg-red-900/20 border border-red-500/40 rounded-lg">
+            Failed to render deck: {error}
+          </div>
+        )}
+
+        {!error && blank && (
+          <div className="absolute inset-0 bg-black flex items-center justify-center text-gray-700 text-sm tracking-widest uppercase">
+            press B to resume
+          </div>
+        )}
+
+        {!error && !blank && deck && (
+          <SlideShadow
+            key={idx}
+            className="present-stage animate-fade-in"
+            html={deck.slides[idx] || ''}
+            css={deck.css || ''}
+            style={{
+              width: 1280,
+              height: 720,
+              transform: `scale(var(--present-scale, 1))`,
+              transformOrigin: 'center center',
+              borderRadius: 12,
+              boxShadow: '0 40px 120px rgba(0,0,0,0.7), 0 0 0 1px rgba(168,85,247,0.22)',
+              overflow: 'hidden',
+              background: '#0a0815',
+            }}
+          />
+        )}
+
+        {/* Side arrow overlays — mouse-only affordances (hidden when blank). */}
+        {!blank && total > 1 && (
+          <>
+            <button
+              onClick={() => setIdx((i) => Math.max(i - 1, 0))}
+              disabled={idx === 0}
+              className="present-chrome absolute left-4 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-gray-300 disabled:opacity-20 disabled:cursor-not-allowed transition-smooth"
+              aria-label="Previous slide"
+            >
+              <ChevronRight className="w-5 h-5 rotate-180" />
+            </button>
+            <button
+              onClick={() => setIdx((i) => Math.min(i + 1, total - 1))}
+              disabled={idx === total - 1}
+              className="present-chrome absolute right-4 top-1/2 -translate-y-1/2 w-10 h-10 rounded-full bg-white/5 hover:bg-white/15 border border-white/10 flex items-center justify-center text-gray-300 disabled:opacity-20 disabled:cursor-not-allowed transition-smooth"
+              aria-label="Next slide"
+            >
+              <ChevronRight className="w-5 h-5" />
+            </button>
+          </>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      {!blank && total > 0 && (
+        <div className="h-1 bg-white/5 relative z-10">
+          <div
+            className="h-full bg-gradient-to-r from-purple-400 to-purple-500 transition-all duration-300"
+            style={{ width: `${((idx + 1) / total) * 100}%` }}
+          />
+        </div>
+      )}
+
+      {/* Speaker notes panel */}
+      {showNotes && !blank && (
+        <div className="border-t border-purple-500/20 bg-black/90 backdrop-blur-sm p-5 max-h-52 overflow-y-auto z-10">
+          <div className="max-w-5xl mx-auto">
+            <div className="flex items-center gap-2 text-[10px] uppercase tracking-widest text-purple-300 mb-3">
+              <StickyNote className="w-3 h-3" />
+              <span>Speaker notes — slide {idx + 1}</span>
+            </div>
+            <div className="text-sm text-gray-200 prose prose-invert prose-sm max-w-none">
+              {speakerNotes[idx - 2] ? (
+                <ReactMarkdown remarkPlugins={[remarkGfm]}>
+                  {speakerNotes[idx - 2]}
+                </ReactMarkdown>
+              ) : (
+                <div className="text-gray-500 italic">
+                  No notes for this slide. Notes are lifted from the orchestrator's <code className="text-purple-300">thoughtProcess</code> on per-agent finding slides.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Fade animation for slide transitions. Transform must include
+          `scale()` because the stage is itself scale-transformed. */}
+      <style>{`
+        @keyframes fadeInSlide {
+          from { opacity: 0; transform: scale(var(--present-scale, 1)) translateY(8px); }
+          to   { opacity: 1; transform: scale(var(--present-scale, 1)) translateY(0); }
+        }
+        .animate-fade-in { animation: fadeInSlide 180ms ease-out; }
+      `}</style>
+      <PresentScaleBinder showNotes={showNotes} />
+    </div>
+  )
+}
+
+// Tiny helper component that keeps the stage transform in sync with the
+// viewport dimensions by writing a CSS variable. Separated to keep the main
+// PresentModal body readable.
+function PresentScaleBinder({ showNotes }) {
+  useEffect(() => {
+    const update = () => {
+      const chromeTop = 52         // top toolbar (~py-2.5 + content)
+      const progressBar = 4        // gradient progress strip
+      const notesPanel = showNotes ? 208 : 0  // max-h-52
+      const gutter = 64            // comfortable breathing room
+      const availW = window.innerWidth - gutter
+      const availH = window.innerHeight - chromeTop - progressBar - notesPanel - gutter
+      const scale = Math.min(availW / 1280, availH / 720, 1)
+      document.documentElement.style.setProperty('--present-scale', String(Math.max(scale, 0.2)))
+    }
+    update()
+    window.addEventListener('resize', update)
+    return () => window.removeEventListener('resize', update)
+  }, [showNotes])
+  return null
 }
 
 function App() {
@@ -2486,7 +2809,26 @@ function App() {
   const [isDraggingOver, setIsDraggingOver] = useState(false)
   // Export bundle modal
   const [showExportBundle, setShowExportBundle] = useState(false)
+  // MARP present mode
+  const [showPresent, setShowPresent] = useState(false)
+  // Deck title that the analyst last confirmed (or edited) when opening
+  // Present mode. Kept here so the live viewer and the downloadable HTML
+  // stay in sync if the analyst chooses a new title between invocations.
+  const [presentTitle, setPresentTitle] = useState('SPECTRA Investigation')
   const fileInputRef = useRef(null)
+
+  // Prompt the analyst for the deck title — pre-filled with an inference
+  // from the conversation so a single <Enter> key accepts the suggestion.
+  // Returns null if the user cancels.
+  const askDeckTitle = () => {
+    const suggested = inferDeckTitle(messages)
+    const entered = window.prompt(
+      'Title for the presentation (cover slide):',
+      suggested,
+    )
+    if (entered === null) return null
+    return entered.trim() || suggested
+  }
 
   // Reload conversation evidences whenever the key changes or storage bumps.
   const reloadEvidences = async () => {
@@ -2674,6 +3016,56 @@ function App() {
       setMcpStatus({ status: 'unhealthy', error: error.message })
     } finally {
       setIsCheckingStatus(false)
+    }
+  }
+
+  // One-click "Brief this case" — download a standalone MARP HTML deck.
+  // Reuses the same renderer as the Case Bundle checkbox, just without the
+  // ZIP wrapper. Images from the conversation's evidences are inlined as
+  // data URLs so the file works offline.
+  const handleBriefCase = async () => {
+    if (messages.length === 0) return
+    // Infer a sensible title (e.g. "Apollo Ransomware") and let the
+    // analyst confirm or override it via `askDeckTitle`.
+    const deckTitle = askDeckTitle()
+    if (deckTitle === null) return // user cancelled
+    try {
+      // Inline image thumbnails for the gallery slide.
+      const deckEvidences = await Promise.all(conversationEvidences.map(async (ev) => {
+        if (!String(ev.mime || '').startsWith('image/')) return ev
+        try {
+          const dataUrl = await evidenceStore.readEvidenceAsDataUrl(ev.id)
+          return { ...ev, dataUrl }
+        } catch {
+          return ev
+        }
+      }))
+      const { html, css } = renderDeck({
+        title: deckTitle,
+        messages,
+        evidences: deckEvidences,
+        meta: {
+          console: activeDestination?.name || null,
+          llm: settings ? `${settings.llm_provider} / ${settings.llm_model}` : null,
+        },
+      })
+      const standalone = wrapStandalone({ html, css, title: deckTitle })
+      const blob = new Blob([standalone], { type: 'text/html;charset=utf-8' })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      // Derive the download filename from the chosen deck title so the file
+      // name matches the cover on disk.
+      const slug = deckTitle
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'spectra-brief'
+      a.download = `${slug}-${new Date().toISOString().slice(0, 10)}.html`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } catch (e) {
+      console.error('[MARP] Brief this case failed:', e)
+      alert(`Brief generation failed: ${e.message || e}`)
     }
   }
 
@@ -3550,6 +3942,30 @@ function App() {
               <Package className="w-4 h-4 text-purple-400" />
             </button>
             <button
+              onClick={handleBriefCase}
+              disabled={messages.length === 0}
+              className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Brief this case — one-click MARP slide deck (HTML)"
+            >
+              <Presentation className="w-4 h-4 text-purple-400" />
+            </button>
+            <button
+              onClick={() => {
+                // Ask up-front so the cover slide is right the first time —
+                // showing the modal with a wrong title and requiring a
+                // round-trip would be a worse UX than a single prompt.
+                const t = askDeckTitle()
+                if (t === null) return
+                setPresentTitle(t)
+                setShowPresent(true)
+              }}
+              disabled={messages.length === 0}
+              className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth disabled:opacity-30 disabled:cursor-not-allowed"
+              title="Present — full-screen threat story"
+            >
+              <Play className="w-4 h-4 text-purple-400" />
+            </button>
+            <button
               onClick={startNewConversation}
               disabled={messages.length === 0 && pendingEvidences.length === 0}
               className="p-2 glass rounded-xl hover:bg-white/10 transition-smooth disabled:opacity-30 disabled:cursor-not-allowed"
@@ -3593,6 +4009,20 @@ function App() {
         onDestinationsChange={() => {
           reloadFromStorage()
           checkMcpHealth()
+        }}
+      />
+
+      {/* Present mode (MARP full-screen) */}
+      <PresentModal
+        isOpen={showPresent}
+        onClose={() => setShowPresent(false)}
+        title={presentTitle}
+        messages={messages}
+        evidences={conversationEvidences}
+        meta={{
+          console: activeDestination?.name || null,
+          // Intentionally no `llm` field — model identity is speaker-only
+          // information and the renderer already omits it from the deck.
         }}
       />
 

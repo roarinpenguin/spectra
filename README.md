@@ -9,7 +9,94 @@
 ![SPECTRA](https://img.shields.io/badge/SPECTRA-Security%20Assistant-8B5CF6?style=for-the-badge)
 ![License](https://img.shields.io/badge/License-MIT-green?style=for-the-badge)
 ![Docker](https://img.shields.io/badge/Docker-Ready-2496ED?style=for-the-badge&logo=docker&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.2.0-8B5CF6?style=for-the-badge)
+![Version](https://img.shields.io/badge/version-1.3.0-8B5CF6?style=for-the-badge)
+
+---
+
+## 🆕 What's new in **v1.3 — April 2026**
+
+**Investigations become briefings.**
+
+v1.3 adds a full MARP slide-deck pipeline that renders any SPECTRA
+conversation as an executive briefing — exportable as a standalone HTML
+file, optionally packaged inside a Case Bundle, or presented live in
+full-screen from the app.
+
+### Highlights
+
+- **🎞️ Brief this case (one-click).** New toolbar button renders the
+  current conversation as an executive deck and downloads a
+  self-contained `*.html` file: cover → executive summary → per-agent
+  findings → evidence gallery → MITRE ATT&CK kill-chain → recommended
+  actions → appendix. Image evidences are inlined as data URLs so the
+  file works offline (open, then *Print → Save as PDF* from the browser
+  for a PDF copy — the exported HTML ships with `print-color-adjust:
+  exact` so gradients, the purple theme, the logo watermark and all
+  backgrounds survive the browser's *Background graphics = off* default).
+  Powered by `@marp-team/marpit` with a custom SPECTRA purple theme and
+  the SPECTRA logo embedded as an inline SVG data URI; everything runs
+  client-side.
+- **📦 MARP inside Case Bundles.** The Case Bundle export modal now has a
+  *MARP slide deck (HTML)* checkbox — when ticked, `deck.html` is added
+  to the ZIP alongside `conversation.md`, `conversation.pdf`,
+  `messages.json` and the `evidences/` folder. Useful for handover ZIPs
+  that include both the full evidence trail and a ready-to-present
+  summary.
+- **🎤 Present mode ("Threat story").** A dedicated toolbar button opens
+  a full-screen slide show that renders the same deck inside the app.
+  Keyboard bindings: `← / →` or `PageUp / PageDown` to navigate, `Home /
+  End` to jump, `B` to blank the screen (for questions), `S` to toggle
+  speaker notes, `Esc` to exit. The stage auto-scales to the viewport
+  while preserving the 16:9 aspect ratio.
+- **✍️ Smart deck titles.** When you click *Brief* or *Present*, SPECTRA
+  scans the transcript for threat-vocabulary keywords and capitalised
+  proper nouns to pre-fill a suggested title (e.g. *Investigation —
+  Apollo Ransomware*, *Investigation — Salt Typhoon Campaign*). A single
+  prompt lets you accept or override it; the chosen title drives the
+  cover slide, the downloaded filename, and the Present-mode chrome.
+- **📐 Block-aware pagination (no overflow, no orphans).** The renderer
+  tokenises each section into atomic blocks — headings, paragraphs,
+  lists, tables, fenced code, blockquotes — assigns each a realistic
+  visual weight, and packs them greedily onto slides. Tables and code
+  fences are never split mid-way, headings are never separated from
+  their body, empty continuation slides are suppressed, and long
+  sections flow automatically onto `(cont.)` slides instead of being
+  silently clipped under the page counter.
+- **🛠️ Tools used, in the slide footer.** Each finding slide carries a
+  `Tools: alert_triage · correlation · threat_hunt` strip in the bottom-
+  left chrome, tying the slide's content to the exact MCP tools that
+  produced it. Repeated on continuation slides so viewers never have to
+  flip back for provenance.
+- **🎭 Human-readable agent names.** Agent handles are displayed in
+  Title Case throughout the deck (`alert_triage` → *Alert Triage*,
+  `threat_hunt` → *Threat Hunt*, `purple_ai` → *Purple AI*, …) via a
+  central alias map, with a generic Title-Case fallback for unknown
+  handles.
+- **🧠 Speaker notes from thought process.** The Present view lifts each
+  assistant turn's `thoughtProcess` (classification + reason + tool
+  calls) into a speaker-notes overlay the presenter sees but the audience
+  doesn't — perfect for tabletop walk-throughs or purple-team readouts.
+- **🎯 Zone-aware deck extraction.** Slides reuse the same
+  `classifyZone()` heuristics as the chat UI, so "Executive Summary" /
+  "Summary" / "TL;DR" sections populate the exec slide automatically,
+  "Recommended Actions" / "Remediation" populate the actions slide, and
+  everything else becomes per-agent findings slides. No manual tagging
+  required in the conversation.
+- **🪄 MITRE ATT&CK kill-chain mapping.** The renderer scrapes `Txxxx`
+  and `Txxxx.yyy` technique ids from the conversation and assembles a
+  clickable kill-chain slide grouped by tactic in canonical
+  Reconnaissance → Impact order; each chip deep-links to
+  `attack.mitre.org`.
+
+### Dependency added
+
+- `@marp-team/marpit ^3.1.2` in the frontend (small, MIT, pure-JS).
+
+### Upgrading from v1.2
+
+1. `git pull && docker compose build frontend && docker compose up -d`
+2. No storage migration required — decks are rendered on demand from the
+   same conversation + evidence data already in IndexedDB/localStorage.
 
 ---
 
@@ -169,6 +256,10 @@ SPECTRA is an AI-powered security investigation assistant that provides SOC anal
 | **Case Bundle Import** *(v1.2)* | Re-hydrate any SPECTRA ZIP: validates SHA-256, dedupes evidences, conflict resolution dialog |
 | **Chat Zones** *(v1.2)* | One-click expand/collapse categories (Exec, Actions, Findings, Thoughts, Tools, Evidence) |
 | **Evidence-aware LLM** *(v1.2)* | Small text/JSON inlined into the model's context; binaries referenced by metadata |
+| **MARP Brief Export** *(v1.3)* | One-click 7-slide executive deck (HTML) with SPECTRA theme + inlined image evidences |
+| **MARP Present Mode** *(v1.3)* | Full-screen in-app slide show with keyboard nav, blank-screen, speaker notes |
+| **Speaker Notes** *(v1.3)* | Notes auto-filled from each assistant turn's thought process (classification, reason, tools) |
+| **Auto MITRE Grid** *(v1.3)* | Technique ids scraped from the conversation and rendered as a dedicated slide |
 | **Modern UI** | Purple-themed glass morphism design with responsive layout |
 
 ---

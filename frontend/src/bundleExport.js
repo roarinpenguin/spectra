@@ -18,6 +18,7 @@
 
 import { zipSync, strToU8 } from 'fflate'
 import * as evidenceStore from './evidenceStore'
+import { renderDeck, wrapStandalone } from './marpRenderer'
 
 // Bump when the on-disk layout changes in a breaking way.
 //   v1 — original layout (Markdown-only, no messages.json).
@@ -146,6 +147,7 @@ function renderReadme({ title, options, counts }) {
       `${options.redact ? ' redacted content' : ' full content'}).`,
     `  - conversation.md     Markdown export of the whole chat.`,
     options.includePdf ? `  - conversation.pdf    PDF rendering of the chat.` : null,
+    options.includeDeck ? `  - deck.html           Standalone MARP slide deck (open in a browser).` : null,
     counts.artefacts ? `  - artefacts/          ${counts.artefacts} agent/tool artefact(s).` : null,
     counts.evidences ? `  - evidences/          ${counts.evidences} evidence file(s) + .meta.json sidecars.` : null,
     ``,
@@ -154,6 +156,7 @@ function renderReadme({ title, options, counts }) {
     `  PDF:        ${options.includePdf ? 'on' : 'off'}`,
     `  Artefacts:  ${options.includeArtefacts ? 'on' : 'off'}`,
     `  Evidences:  ${options.includeEvidences ? 'on' : 'off'}`,
+    `  Deck:       ${options.includeDeck ? 'on' : 'off'}`,
     `  Redaction:  ${options.redact ? 'on' : 'off'}`,
     ``,
     `Re-import: drop this ZIP onto the SPECTRA Library "Import Bundle" button`,
@@ -191,6 +194,7 @@ export async function exportCaseBundle({
     includePdf: !!(options.includePdf && pdfBlob),
     includeArtefacts: options.includeArtefacts !== false,
     includeEvidences: options.includeEvidences !== false,
+    includeDeck: !!options.includeDeck,
     redact: !!options.redact,
   }
 
@@ -284,6 +288,37 @@ export async function exportCaseBundle({
   })
   const messagesJsonBytes = strToU8(JSON.stringify(canonical, null, 2))
 
+  // ----------------------- MARP deck (optional) -----------------------
+  // The deck consumes the same messages + evidences model. Images are
+  // inlined as data URLs so the standalone HTML works offline (file://).
+  let deckBytes = null
+  if (opts.includeDeck) {
+    progress('Rendering MARP deck…')
+    // Thumbnails only for images — avoid bloating the deck with binaries.
+    const deckEvidences = await Promise.all(evidencesMeta.map(async (ev) => {
+      if (!String(ev.mime || '').startsWith('image/')) return ev
+      try {
+        const dataUrl = await evidenceStore.readEvidenceAsDataUrl(ev.id)
+        return { ...ev, dataUrl }
+      } catch {
+        return ev
+      }
+    }))
+    try {
+      const { html, css } = renderDeck({
+        title,
+        messages: opts.redact ? canonical : messages,
+        evidences: deckEvidences,
+        meta,
+      })
+      const standalone = wrapStandalone({ html, css, title })
+      deckBytes = strToU8(standalone)
+    } catch (err) {
+      console.error('[bundleExport] MARP deck render failed:', err)
+      // Non-fatal: keep packaging the rest of the bundle.
+    }
+  }
+
   // ----------------------- artefacts -----------------------
   const artefacts = {}
   if (opts.includeArtefacts) {
@@ -322,6 +357,7 @@ export async function exportCaseBundle({
   }
   files['messages.json'] = messagesJsonBytes
   if (pdfBytes) files['conversation.pdf'] = pdfBytes
+  if (deckBytes) files['deck.html'] = deckBytes
 
   const checksums = {}
   for (const [name, bytes] of Object.entries(files)) {
@@ -367,6 +403,8 @@ export async function exportCaseBundle({
     name === 'conversation.md' ||
     name === 'README.txt' ||
     name === 'manifest.json' ||
+    name === 'messages.json' ||
+    name === 'deck.html' ||
     name.startsWith('artefacts/') ||
     name.endsWith('.meta.json')
 

@@ -9,6 +9,7 @@
     "preview": "vite preview"
   },
   "dependencies": {
+    "@marp-team/marpit": "^3.1.2",
     "fflate": "^0.8.2",
     "html2canvas": "^1.4.1",
     "jspdf": "^2.5.1",

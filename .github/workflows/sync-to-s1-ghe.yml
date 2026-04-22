@@ -1,0 +1,29 @@
+name: Sync to SentinelOne GHE
+
+on:
+  push:
+    branches:
+      - main            t
+  workflow_dispatch:     # allow manual runs from the Actions tab
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up SSH for GHE
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.S1_GHE_DEPLOY_KEY }}
+
+      - name: Add GHE remote and push
+        run: |
+          git remote add s1-ghe git@ghe.eng.sentinelone.tech:marco-rottigni/spectra.git || \
+            git remote set-url s1-ghe git@ghe.eng.sentinelone.tech:marco-rottigni/spectra.git
+
+          # Ensure we push the current HEAD branch to main on GHE
+          CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+          git push s1-ghe "$CURRENT_BRANCH":main --force-with-lease

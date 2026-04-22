@@ -3,7 +3,7 @@ name: Sync to SentinelOne GHE
 on:
   push:
     branches:
-      - main            t
+      - main
   workflow_dispatch:     # allow manual runs from the Actions tab
 
 jobs:
